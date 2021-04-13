@@ -1,0 +1,394 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+  html_document:
+    df_print: paged
+subtitle: Lab5 - data clustering
+email: a.janusz@mimuw.edu.pl
+---
+
+### The plan:
+
+1. _K-means_ algorithm, its variants and extensions.
+2. Visualization of clustering results.
+3. Hierarchical clustering.
+4. Density-based clustering - _DBscan_ algorithm.  
+
+```{r setup, results=FALSE}
+options(width = 120)
+library(data.table)
+library(cluster)
+library(proxy)
+library(dbscan)
+library(mlbench)
+library(ggplot2)
+library(ggfortify)
+library(gridExtra)
+```
+
+### The k-means algorithm
+
+The basic _k-means_ consists of the following steps:   
+
+1. Choose at random k initial cluster centers - points in the original attribute space.
+2. Assign each data point to the closest center - points are divided into k groups.
+3. Compute new cluster centers (e.g. by averaging points within each cluster).
+4. Repeat steps 2 and 3 until the algorithm converges.
+
+The most widely used implementation of this algorithm in R is the _kmeans_ function.  
+
+Since the results of _k-means_ clustering are strongly dependent on the initial selection of cluster centers, this part of the algorithm is the most important one. Many strategies for selecting the initial centers have been developed, however, the most common approach is based on the idea of repeating _k-means_ many times from random seeds and selecting 'the best' results. In the example below, the _nstart_ parameter indicates the number of repetitions of the algorithm.
+
+Some fundamental questions arise:   
+
+ - how can we visualize the clustering results?
+ - which clustering is the best for our data?
+ - can we compare two clustering results and say which one is better?
+ - how can we select good parameter settings for our clustering algorithm?
+
+
+```{r pluton, results = TRUE, fig.height = 5, fig.width = 10}
+# An example - we use a toy data set about Isotopic Composition Plutonium Batches:
+data(pluton)
+pluton = as.data.frame(scale(pluton,TRUE,TRUE)) # simple scaling...
+
+# let's compute PCA to vizualize the data
+pca = prcomp(pluton)
+fig1 <- ggplot(data.table(pca$x), aes(x=PC1, y=PC2)) +
+  geom_point() + 
+  labs(x = "PC1", y = "PC2", title = "Wizualizacja danych pluton - PCA")
+
+bar_plot <- ggplot(data=data.table(id = 1:4, std = pca$sdev), aes(x=id, y=std)) +
+                   geom_bar(stat="identity", position=position_dodge()) +
+                   labs(title = "Comparison of embeddings")
+
+gridExtra::grid.arrange(bar_plot, fig1, ncol=2)
+
+set.seed(12345)
+clustering1 = kmeans(pluton, centers = 5, iter.max = 50, nstart = 1, algorithm = "Lloyd")
+suppressWarnings({
+  clustering2 = kmeans(pluton, centers = 5, iter.max = 50, nstart = 150, algorithm = "Lloyd")
+})
+
+fig2 <- ggplot(data.table(pca$x), aes(x=PC1, y=PC2, colour = factor(clustering1$cluster))) +
+  geom_point() + 
+  labs(x = "PC1", y = "PC2", colour = "group", title = "Visualization of grouping 1")
+fig3 <- ggplot(data.table(pca$x), aes(x=PC1, y=PC2, colour = factor(clustering2$cluster))) +
+  geom_point() + 
+  labs(x = "PC1", y = "PC2", colour = "group", title = "Visualization of grouping 2")
+
+gridExtra::grid.arrange(fig2, fig3, ncol=2)
+``` 
+
+To compare different clustering results (e.g., to select suitable clustering algorithm or good parameter settings), we need to use some quality criterion. Since in general, there is no single 'objective' way to decide what is _a good clustering_ without considering the context of a specific application domain, it is important to choose a quality measure that is appropriate for the task at hand.   
+
+We can divide clustering quality criteria into _extrinsic_ and _intrinsic_ measures:  
+
+1. _Extrinsic_ measures require _ground truth_ cluster labels. Examples are _adjusted rand index_, _Fowlkes-Mallows scores_, _mutual information_ based scores, _homogeneity_, and _completeness_. Those measures have little practical usefulness - if you have labels for some part of your data, it is more beneficial to use _supervised_ (preduction models) or _semi-supervised_ learning techniques.
+2. _Intrinsic_ measures does not require _ground truth_ labels. Some of the intrinsic clustering performance measures are:  
+
+ - sum/mean of squared distances to cluster centers
+ - _silhouette coefficient_ or _silhouette width_, 
+ - _Calinski-Harabasz index_, _Davies-Bouldin_ index, _Dunn index_ etc.,
+
+How can we compare clusterings with different numbers of groups?
+
+```{r quality_measures}
+# For example, let's take the total sum of squared distances to cluster centers:
+cat("For the first clustering:", mean(clustering1$withinss), "\n", sep = "\t")
+cat("For the second clustering:", mean(clustering2$withinss), "\n", sep = "\t")
+
+#' We may compare values of this measure for various cluster sizes:
+tmpVec = rep(0,20)
+for(i in 2:20)  {
+  tmpClust = kmeans(pluton, centers = i, iter.max = 50, nstart = 150) 
+  tmpVec[i] = mean(tmpClust$withinss/tmpClust$size)
+}
+ggplot(data.frame(x = 1:20, y = tmpVec)) + 
+  geom_line(aes(x, y), color = 'blue') + xlab('Number of groups') + ylab('WSS') +
+  ggtitle("We can use 'the elbow rule'")
+rm(tmpClust, tmpVec)
+```
+
+An example of a different measure, which is not monotonic with regard to the number of clusters, is the _silhouette width_. For a single data point _silhouette_ is defined as:
+$$s(i) = \frac{\left( b(i) - a(i)\right)}{max( a(i), b(i) )},$$
+where $a(i)$ is the average distance (or dissimilarity) of point $i$ to points from the same cluster, and $b(i)$ is a minimum of the average distances of $i$ to points from a different cluster. The _silhouette width_ is a mean of the silhouette coefficients of all data points: $$\frac{1}{N}\sum_{i = 1}^{N} s(i).$$
+
+```{r sillhouette}
+# an example:
+silhouetteVec = rep(0,20)
+distMatrix = dist(pluton)
+for(i in 2:20)  {
+  clustering = kmeans(pluton, centers = i, iter.max = 50, nstart = 150)
+  silhouetteVec[i] = mean(silhouette(clustering$clust, distMatrix)[,3])
+  rm(clustering)
+}
+ggplot(data.frame(x = 1:20, y = silhouetteVec)) + 
+  geom_line(aes(x, y), color = 'blue') + xlab('Number of groups') + ylab('silhouette width') +
+  ggtitle(paste0("According to the silhouette width, the best clustering is for the division into ", 
+                   which.max(silhouetteVec), " groups."))
+
+# There is also a method for plotting results of clustering called 'clusplot':
+clusterNames = paste("Gr", 1:which.max(silhouetteVec), sep="")
+clustering = kmeans(pluton, centers = which.max(silhouetteVec), iter.max = 50, nstart = 150)
+clusplot(pluton, clusterNames[clustering$cluster], labels = 2, 
+         stand = TRUE, shade = TRUE)
+
+# We may also plot a 'silhouette plot':
+plot(silhouette(clustering$clust, dist(pluton)), do.n.k = TRUE, do.clus.stat = TRUE,
+     main=paste("Silhouette for clustering into ", which.max(silhouetteVec), " groups", sep=""),
+     xlab = "", ylab = "Points in consecutive groups (sorted by silhouette width)")
+mtext(expression("Wilhouette width "* s[i]), side = 1, line = 3)
+```
+
+### Partitioning Around Medoids (PAM)
+
+_PAM_ is a modification to the _k-means_ algorithm that is more robust in a presence of data outliers.
+
+```{r pam, fig.height= 5, fig.width= 10}
+# an additional advantage of PAM is the fact that we may use any dissimilarity measure to cluster the data
+par(mfrow =c(1,2))
+pamClustering = pam(pluton, k = 3, metric = "manhattan")
+plot(pamClustering, labels = 2, stand = TRUE, shade = TRUE)
+
+# We can get the same result by supplying a distance matrix (or dissimilarities)
+distMatrix = dist(pluton, method = "manhattan")
+pamClustering = pam(distMatrix, k = 3)
+plot(pamClustering, labels = 2, stand = TRUE, shade = TRUE, data = pluton)
+
+# PAM is less sensitive to outliers - let's add one to our data:
+par(mfrow =c(1,2))
+pl1 = ggplot(data.frame(pca$x)) + 
+  geom_point(aes(PC1, PC2), color = 'blue') + xlab('PC1') + ylab('PC2')
+pluton = rbind(pluton, c(7, -1, 7, 1))
+pca = prcomp(pluton)
+pl2 = ggplot(data.frame(pca$x)) + 
+  geom_point(aes(PC1, PC2), color = 'blue') + xlab('PC1') + ylab('PC2')
+gridExtra::grid.arrange(pl1, pl2, ncol = 2)
+```
+```{r pam_plots, fig.height= 5, fig.width= 10}
+# Let's compute kmeans again
+kmeansClustering = kmeans(pluton, centers = 3, iter.max = 50, nstart = 150)
+pl1 = ggplot(data.frame(pca$x)) + 
+  geom_point(aes(PC1, PC2), color = kmeansClustering$cluster + 1) + 
+  ggtitle("kmeans - 3 groups") + xlab('PC1') + ylab('PC2')
+
+pamClustering = pam(pluton, k = 3, metric = "manhattan")
+pl2 = ggplot(data.frame(pca$x)) + 
+  geom_point(aes(PC1, PC2), color = pamClustering$clustering + 1) + 
+  ggtitle("PAM - 3 groups") + xlab('PC1') + ylab('PC2')
+gridExtra::grid.arrange(pl1, pl2, ncol = 2)
+```
+
+The biggest disadvantage of _PAM_ is its computational complexity, however, there is an approximate version of this method called _clara_.
+
+```{r clara, fig.height= 5, fig.width= 5}
+# on small data it can work in exactly the same way as PAM
+claraClustering = clara(pluton, k = 3, metric = "manhattan", 
+                        samples = 5, sampsize = 10, pamLike = TRUE)
+plot(pca$x, col = claraClustering$clustering + 1, 
+     main="clara - 3 groups", xlab = "X", ylab = "Y")
+
+#' Let's try to apply those two methods on some larger data:
+dataSet = mlbench.2dnormals(10000, 3, r=3)$x
+plot(dataSet)
+
+system.time({
+  pamClustering = pam(dataSet, k = 3, metric = "euclidean");
+  plot(dataSet, col = pamClustering$clustering + 1, 
+       main="PAM - 3 groups", xlab = "X", ylab = "Y");
+})
+
+system.time({
+  claraClustering = clara(dataSet, k = 3, metric = "euclidean", samples = 100, sampsize = 50, pamLike = TRUE);
+  plot(dataSet, col = claraClustering$clustering + 1, 
+       main="clara - 3 groups", xlab = "X", ylab = "Y");
+})
+```
+
+### Hierarchical clustering
+
+There are two main approaches to hierarchical clustering: _agglomerative_ and _divisive_.    
+
+In the _agglomerative_ approach, we start from a division into as many groups as there are points in the data. Then, in consecutive
+steps, we merge two closest groups. A distance between groups can be defined in various ways. We use for that purpose a _linkage function_. Typical examples of such functions are _single_ and _complete_ linkage.   
+Examples of implementations in R: _agnes_, _hclust_.
+
+```{r figures-side2, fig.show="hold", out.width="50%", fig.width=10, fig.height=5}
+data(pluton)
+pluton = as.data.frame(scale(pluton,T,T))
+pca = prcomp(pluton)
+
+par(mfrow =c(1,2))
+distM = dist(pluton, method = "euclidean")
+agnesClustSingle = agnes(distM, method = "single")
+plot(agnesClustSingle, which.plots = 2, main = 'single link')
+
+agnesClustComplete = agnes(distM, method = "complete")
+plot(agnesClustComplete, which.plots = 2,  main = 'complete link')
+
+# we can extract the clustering into a specific number of clusters using 'cutree'
+flatClustering = cutree(agnesClustSingle, k = 3)
+par(mfrow =c(1,1))
+ggplot(data.frame(pca$x)) + 
+  geom_point(aes(PC1, PC2), color = flatClustering + 1) + 
+  ggtitle("single link - 3 groups") + xlab('PC1') + ylab('PC2')
+```
+
+
+In the _divisive_ approach to data clustering, we start by assigning all points to the same big group, and then, we divide it until each object becomes a different cluster. At each step, we divide a group with the largest diameter.    
+Example of an implementation in R: diana
+
+```{r diana, fig.height= 5, fig.width= 5}
+dianaClustering = diana(distM)
+plot(dianaClustering, which.plots = 2)
+plot(pca$x, col = cutree(dianaClustering, k = 3) + 1, 
+     main="diana - 3 clusters")
+```
+
+Visualization of clustering trees - augmentation of the plots.
+
+```{r tree_augment, fig.height= 5, fig.width= 5}
+#' An example of a tree trimming function which also modifies default labels in leaves:
+trim = function(node) {
+  if(attr(node, "height") < 0.3) attr(node, "height") = 0.3
+  if(is.leaf(node)) {
+    if(attr(node, "height") == 0.3) attr(node, "height") = 0.2
+    if(attr(node,"x.member") > 1)  attr(node, "label") = paste(sub("Branch", "Cluster", attr(node, "label")), ": ", attr(node,"x.member"), " members", sep="")
+    else attr(node, "label") = paste(sub("Branch", "Cluster", attr(node, "label")), ": ", attr(node,"x.member"), " member", sep ="")
+  }
+  return(node)
+}
+
+# we iterate through the clustering tree with dendrapply
+trimmedTree = dendrapply(cut(as.dendrogram(agnesClustSingle), h = 0.7)$upper, trim)
+
+plot(trimmedTree, main = "Trimmed clustering tree", ylim = c(-0.1, 1.9), 
+     edgePar = list(lwd = 1), center = TRUE,
+     nodePar = list(col=3:2, cex=c(4.0, 1.75), 
+                    pch= 21:22, bg= c("light blue", "pink"), 
+                    lab.cex = 1.2, lab.col = "Red"))
+
+```
+
+One big disadvantage of all hierarchical clustering algorithms its their high computational complexity - many require $O(N^3)$ time and $O(N^2)$ space.   
+
+When it is a good idea to use the hierarchical clustering methods? When shapes of clusters are irregular.
+
+```{r hierarchic_example, fig.height= 5, fig.width= 5} 
+# Example 1:
+plot(mlbench.smiley())
+smileyData = mlbench.smiley()$x
+
+# let's try to cluster the data with PAM
+pamClustering = pam(smileyData, k = 4)
+plot(smileyData, main = "PAM clustering for the smiley data", xlab = "", ylab = "", 
+     col = c("Red", "Green", "Black", "Blue")[pamClustering$clustering])
+
+# and now, we do the same using single linkage
+distM = dist(smileyData, method = "euclidean")
+agnesClustSingle = agnes(distM, method = "single")
+plot(smileyData, main = "single link clustering for the smiley data", xlab = "", ylab = "", 
+     col = c("Red", "Green", "Black", "Blue")[cutree(agnesClustSingle, k = 4)])
+
+# Example 2:
+plot(mlbench.spirals(500,2,0.03))
+spiralsData = mlbench.spirals(500,2,0.03)$x
+
+# This time, let's try kmeans...
+kmeansClustering = kmeans(spiralsData, centers = 2, iter.max = 50, nstart = 150)
+plot(spiralsData, main = "kmeans clustering for the spirals data", xlab = "", ylab = "",
+     col = c("Red", "Green", "Black", "Blue")[kmeansClustering$cluster])
+
+# and single link again
+distM = dist(spiralsData, method = "euclidean")
+agnesClustSingle = agnes(distM, method = "single")
+plot(spiralsData, main = "single link clustering for the spirals data", xlab = "", ylab = "",
+     col = c("Red", "Green", "Black", "Blue")[cutree(agnesClustSingle, k = 2)])
+```
+
+Unfortunately, hierarchical clustering algorithms are too slow for large data sets. Faster implementations of the _hclust_ function can be found in libraries _fastcluster_ and _flashClust_.
+
+Is there an alternative to hierarchical clustering?
+
+### Density-based clustering - the DBscan algorithm
+
+Density-based algorithms define clusters as areas in the attribute space where there are more points than in the surrounding area.
+
+```{r dbscan, fig.height= 5, fig.width= 5}
+# to find good settings for the parameters of DBscan we may check the distribution of distances to k-th neighbor
+# let's do it for k = 4
+kNNdistplot(smileyData, k = 4)
+
+dbscanClustering = dbscan(smileyData, 0.1, 4)
+table(dbscanClustering$cluster)
+
+#' the points from cluster '0' are regarded as noise - we will plot them in white :-)
+plot(smileyData, main = "dbscan clustering for the smiley data - no noise", 
+     col = dbscanClustering$cluster)
+
+#' now, let's plot all points
+plot(smileyData, main = "dbscan clustering for the smiley data", 
+     col = dbscanClustering$cluster + 1)
+
+# This implementation can deal with larger data:
+bigSmileyData = mlbench.smiley(5000)$x
+
+system.time({
+  dbscanClustering = dbscan(bigSmileyData, 0.05, 4)
+  plot(bigSmileyData, col = dbscanClustering$cluster + 1, 
+       main="dbscan clustering for the big smiley data");
+})
+
+system.time({
+  distM = dist(bigSmileyData, method = "euclidean")
+  agnesClustSingle = agnes(distM, method = "single")
+  plot(bigSmileyData, main = "single link clustering for the big smiley data", 
+       col = c("Red", "Green", "Black", "Blue")[cutree(agnesClustSingle, k = 4)])
+})
+
+rm(list = ls())
+```
+
+
+### Exercise:
+Would you be able to use some of the clustering methods from this class to segment customers from the _cosmeticsData.csv_ data? You can represent the customers by their spendings on products from different categories (e.g., by counting how many products they bought from each category or how much money they spent). Remember that you can combine the clustering task with the dimensionality reduction method from our previous class.
+
+A link to the cosmetics data set:  
+https://drive.google.com/file/d/1dbpYjIN3ArP2NZgviGWNiTIDj3KoitCf/view?usp=sharing
+
+```{r real_life_data}
+# loading the data
+cosmeticsData = data.table::fread('cosmeticsData.csv', sep = ',', header = TRUE) # the data set is available in the Drive
+
+# some of the data, including product ids, is missing...
+cosmeticsData[, any(is.na(productID))]
+
+cosmeticsData = cosmeticsData[!(is.na(categoryID) | is.na(customerID))]
+head(cosmeticsData)
+
+# number of customers in the data:
+cosmeticsData[, uniqueN(customerID)]
+
+# transforming data from long to wide format
+wideData = dcast(cosmeticsData, customerID ~ categoryID, 
+                 fun.aggregate = sum, value.var = "productValue")
+head(wideData)
+
+# below is the space to solve the task:
+
+```
+
+
+\
+\
+\
+  
+  
+  

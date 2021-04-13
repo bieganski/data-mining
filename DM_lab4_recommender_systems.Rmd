@@ -1,0 +1,309 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+  html_document:
+    df_print: paged
+subtitle: Lab4 - linear algebra and recommender systems
+email: a.janusz@mimuw.edu.pl
+---
+
+### The plan:
+
+0. Basic algebraic operations in R.
+1. Eigenvalues and eigenvectors in R.
+2. PCA (principal component analysis).
+3. SVD (singular value decomposition).  
+
+```{r setup, results=FALSE}
+options(width = 120)
+library(data.table)
+library(scatterplot3d)
+library(Rtsne)
+library(proxy)
+```
+
+### Basic algebraic operations in R
+
+A little recollection from our first lab and the linear algebra lecture:
+
+```{r linear_algebra}
+myVector1 = 1:3
+myVector2 = seq(6,2,-2)
+
+# Euclidean norm (Lp2):
+sqrt(sum(myVector1^2))  # this is the vector's length
+
+# a dot product of two vectors:
+myVector1 %*% myVector2
+
+is(myVector1 %*% myVector2)
+is(sum(myVector1 * myVector2)) # the class is different 
+
+# matrices
+myMatrix = matrix(c(1,2,3,3,2,1,1,2,1), nrow = 3, byrow = TRUE)
+
+# adding a column
+tmpMatrix = cbind(myMatrix, myVector1)
+colnames(tmpMatrix) = NULL
+tmpMatrix
+
+# transposed matrix:
+t(tmpMatrix)
+all(tmpMatrix == t(t(tmpMatrix)))
+
+# matrix multiplication:
+tmpMatrix %*% t(tmpMatrix) # a symmetric matrix of size 3x3 (dot products of rows)
+
+t(tmpMatrix) %*% tmpMatrix # a symmetric matrix of size 4x4 (dot products of columns)
+
+# matrix multiplication is not commutative!
+
+symmetricMatrix = t(tmpMatrix) %*% tmpMatrix
+
+# Frobenius norm of a matrix:
+norm(myMatrix, type = "F") # it's an equivalent of the Euclidean norm for vectors
+```
+
+### Eigenvalues and eigenvectors
+
+_Eigenvector_ of a $n \times n$ matrix M is a vector $e$ such that $M * e = v*e$, where $v$ is a scalar called _eigenvalue_. The notion of eigenvector has numerous practical applications in the context of data mining and data exploration. This script covers only a few.    
+
+With R we may compute eigenvalues and eigenvectors using several available implementations. For smaller matrices it can be done using the function _eigen_.
+
+```{r eigenvectors}
+# computation of eigenvectors and eigenvalues
+eigenVectors = eigen(symmetricMatrix, symmetric = FALSE, only.values = FALSE)
+
+eigenVectors # the eigenvectors are in columns of the matrix
+```
+### Principal component analysis (PCA).
+
+The first application of the notion of eigenvalues is related with data visualization, visual data exploration, and dimensionality reduction.    
+
+Often, we would like to find directions along which our data aligns or in other words, directions of the highest variance in the data. If we consider rows in a matrix $M$ as points from $R^k$, then the direction of the highest variance in the data corresponds to the first eigenvector of the column covariance matrix of $M$ (i.e., to the eigenvector with the highest eigenvalue). 
+
+```{r data}
+# Let's load some data:
+dataSet = read.table(file = file.path(getwd(), "wdbc.data"), header = F, sep=',', row.names=1, na.strings="?")
+colnames(dataSet) = c("diagnosis",
+                      paste(c(rep("mean",10), rep("SE",10), rep("worst",10)),
+                            rep(c("radius", "texture", "perimeter", "area",
+                                  "smoothness", "compactness", "concavity",
+                                  "concave_points", "symmetry", "fractal_dimension"),3),
+                            sep="_"))
+
+# for convenience, we create a copy of decision values and we remove them from the data.frame
+classificationVector = dataSet$diagnosis
+dataSet$diagnosis = NULL
+```
+
+This data set, called Breast Cancer Wisconsin (Diagnostic) Data Set, consists of vectors of some basic
+characteristics computed from a digitized image of a fine needle aspirate (FNA) of a breast mass. They describe the cell nuclei present in the image. The decision value in the data says whether the detected tumor is: _B = benign_ or _M = malignant_.    
+
+The directions that we are looking for, correspond to eigenvectors of the matrix $t(dataSet) \%*\% dataSet$ (after centering and scaling the data) with the highest eigenvalues. You may want to compute the eigenvectors 'manually' as an exercise. In the code below, however, we will use the function _prcomp_.
+
+```{r pca,  fig.height = 6, fig.width = 6}
+# computation of principal components
+pca = prcomp(dataSet, center=TRUE, scale=TRUE)
+
+names(pca)
+
+# eigenvalues (standard deviations in the directions of eigenvectors):
+head(pca$sdev)
+
+# a matrix of eigenvectors:
+head(pca$rotation)[, 1:7]
+
+# the data transformed into the new space:
+head(pca$x)[, 1:7]
+
+# now, we may plot the principal components:
+screeplot(pca, npcs = 30, type = "barplot")
+
+# and we can visualize the data in the subspace of the first two components:
+plot(pca$x[,c(1,2)], col = 4 - as.integer(factor(classificationVector)), 
+     pch=as.character(classificationVector), cex=0.7, main="WDBC data in 2 principal components")
+
+# we may also create a 3d plot (but you could also use some more sophisticated libraries for that...)
+scatterplot3d(x = pca$x[,1], y = pca$x[,3], z = pca$x[,2],
+              pch = as.character(classificationVector), color = 4 - as.integer(factor(classificationVector)), 
+              angle = 20, main="WDBC data in 3 principal components")
+```
+
+A common application of PCA is in the dimensionality reduction. A different technique that is often used to visualize high dimensional data is called _t-SNE_. It also uses PCA as a data preprocessing step.
+
+```{r tsne, fig.height = 6, fig.width = 6}
+tSNE = Rtsne::Rtsne(dataSet, dims = 2, initial_dims = 15, perplexity = 10,
+                    max_iter = 1000, theta = 0.1, verbose = FALSE)
+
+plot(tSNE$Y, type = 'p', xlab= 't-SNE x', ylab = 't-SNE y', 
+     main = 'WDBC data in tSNE', col = 4 - as.integer(factor(classificationVector)), cex = 0.5)
+```
+
+### Singular value decomposition (SVD)
+
+Any matrix $X$ with dimensions $m \times n$ and rank $r$ we can decompose into a product: $X = U * D * t(V)$,
+where:
+
+ - $U$ is a matrix $m \times r$, its columns are ortonormal and they correspond to eigenvectors of $X X^T$,
+ - $V$ is a matrix with dimensions $n \times r$, ortonormal columns and they correspond to eigenvectors of $X^T X$,
+ - and $D$ is a diagonal matrix of size $r \times r$, and its values correspond to eigenvalues of $X X^T$ and $X^T X$ (the eigenvalues of those two matrices are the same).
+ 
+We can easily compute the SVD decomposition of a matrix using the _svd_ function, however, please note that there are also some much more computationally efficient alternatives.
+
+```{r svd}
+mySVD = svd(tmpMatrix)
+names(mySVD)
+
+D = diag(mySVD$d)
+U = mySVD$u
+V = mySVD$v
+
+tmpMatrix
+
+U %*% D %*% t(V)
+
+# we expect some numerical issues
+all(tmpMatrix == (U %*% D %*% t(V)))  
+
+# it's correct with a precision greater than 10^{-10}
+all(abs(tmpMatrix - (U %*% D %*% t(V))) < 10^(-10))  
+```
+
+How can SVD be used in the context of data mining? Let's try to use it to construct a simple recommender system.    
+
+Imagine that you are starting a Netflix-like business - you stream movies to your users. You start small - at the beginning you have only seven users and you've collected ratings of movies that they watched...
+
+```{r data_rec}
+# link to the data:
+# https://drive.google.com/file/d/1GYmOYzjKQskigEx0748jeY0BKzxkw9Dy/view?usp=sharing
+
+# 5 - person loved the movie, 1 - person hated the movie, 0 - did not see the movie
+movieRatings = read.table(file = "movieRatings.csv", header = T, row.names= 1, sep = ",")
+movieRatings = as.matrix(movieRatings)
+movieRatings
+
+# Now, let's compute SVD and interpret it...
+ratingsDataSVD = svd(movieRatings)
+```
+
+The columns of matrices $U$, $V$ and $D$ of the decomposition can be interpreted as information about some _hidden concepts_ in our data.   
+
+ - We will interpret the values from the diagonal matrix $D$ as the relevance of those hidden concepts.
+ - The columns of matrix $V$ will tell us about the relation between the concepts and movies (the columns) from our data.
+ - The columns of matrix $U$ will tell us about the relation between the concepts and persons (the rows) from our data.
+
+```{r svd_interp}
+names(ratingsDataSVD$d) = paste("concept", 1:5, sep = "")
+# only the first two 'concepts' are significant
+round(ratingsDataSVD$d, 3)
+
+rownames(ratingsDataSVD$v) = colnames(movieRatings)
+colnames(ratingsDataSVD$v) = paste("concept", 1:5, sep = "")
+# movies with a high absolute value in a column have a strong association with the corresponding concept 
+round(ratingsDataSVD$v, 3)
+
+rownames(ratingsDataSVD$u) = rownames(movieRatings)
+colnames(ratingsDataSVD$u) = paste("concept", 1:5, sep = "")
+# analogically, persons with a high absolute value in a column have a stron association with the corresponding concept
+round(ratingsDataSVD$u, 3)
+```
+
+From a short glipse on the matrices $V$ and $U$, we can tell that there are two significant concepts hidden in our data that correspond to some specific movie types (would you be able to give them a name?). Similarly, some persons are more associated with one concept, than the other.    
+
+Let's focus on the most significant concepts.
+
+```{r}
+D = diag(ratingsDataSVD$d[1:2])
+V = ratingsDataSVD$v[,1:2]
+U = ratingsDataSVD$u[,1:2]
+
+approxData = U %*% D %*% t(V)
+
+round(approxData)
+
+# we can use SVD to reduce the size of data without losing any information!
+# That could be huge saving of data storage...
+all(round(approxData) == movieRatings)
+```
+
+Now, let use SVD to recommend a movie to our new customer.
+
+```{r recommendations}
+# first, we ask our customer to fill a survey and give us some movie ratings
+Basia = c(0, 1, 0, 0, 5)
+names(Basia) = colnames(movieRatings)
+Basia
+
+# how our Basia fits to the discovered concepts?
+conceptRepresentation = Basia %*% V
+round(conceptRepresentation, 3)
+
+# which movies can we recommend to Basia?
+preferencePrediction = conceptRepresentation %*% t(V)
+colnames(preferencePrediction) = colnames(movieRatings)
+round(preferencePrediction, 3)
+
+# we may want to scale our prediction, so that they fit to known ratings:
+round(mean((Basia/preferencePrediction)[Basia > 0]) * preferencePrediction)
+
+cat("We will recommend that Basia see ", 
+    names(sort(preferencePrediction[, Basia == 0], decreasing = TRUE)[1]), 
+    " as her next movie.\n")
+
+# how similar is Basia to others? can we assign her to any customer profile?
+# first, we need to map others into our concept space:
+conceptData = movieRatings %*% V
+round(conceptData, 3)
+
+# then, we compute cosine similarity
+sort(proxy::simil(conceptData, conceptRepresentation, "cosine")[, 1], decreasing = TRUE)
+rm(list = ls())
+```
+
+For larger data it may be necessary to use some more computationally efficient implementation of SVD, e.g., from the library _irlba_. It is important to use for this purpose a sparse representation of data.
+
+### The first data mining assignment
+Below you will find a link to a data set that is going to be used in our first data mining project:
+https://drive.google.com/drive/folders/1vGVAcb0reBKYFfnW6OVXMf4LKtqRLYJi?usp=sharing
+
+To download the data you need to be logged in using your Gmail account from the uw.edu.pl domain.
+
+Records in this data set describe decks of cards used in a popular collectible card video game _Clash Royale_. These decks were obtained using RoyaleAPI.com service, from games which took place in January 2019. Each record consists of five values:
+
+  - a timestamp of the game (column timestamp),
+  - arena ID (column arena_id – higher the arena, more skilled/experienced a player is)
+  - outcome of a game (column has_won, 1 – the player won, 0 the player lost)
+  - a player ID (column tag)
+  - list of exactly eight cards in the player’s deck separated by “_” signs (column player_deck)  
+
+Your task is to analyze this data and search for interesting card usage patterns, and interactions/dependencies between cards. For example:
+
+  - please find card combos that were particularly popular in January 2019 (e.g., top 100 card sets with regard to their support, top 100 card sets of size 2, size 3, etc.),
+  - identify those card combos which have high win-rates (e.g., top 100 card sets with regard to win-rate and with support > 1%),
+  - does the card usage/popularity/effectiveness changes in time?
+  - does the arena level have any influence on card usage/popularity/effectiveness?
+  - find interesting associations between cards,
+  - can you cluster players according to their play patterns and card preferences? 
+  
+Additionally, design and construct a card recommender system that allows players to indicate _four_ cards which they want to have in a deck, and recommends the remaining four to create a reasonable deck. How can you evaluate the effectiveness of your recommendations?
+  
+Report your discoveries in the form of R notebook (with code and all computation outcomes). Please remember about visualizations – make this report as interesting for a reader as you can.
+
+The deadline for sending the reports is Sunday, April 18.
+
+Good luck!    
+
+
+\
+\
+\
+  
+  
+  

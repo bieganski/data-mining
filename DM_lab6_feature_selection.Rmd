@@ -1,0 +1,342 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+  html_document:
+    df_print: paged
+subtitle: Lab6 - feature selection methods
+email: a.janusz@mimuw.edu.pl
+---
+
+### The plan:
+
+0. An example.
+1. Filtering approach to feature selection (FS).
+2. Evaluation of FS methods. 
+
+```{r setup, results=FALSE}
+options(width = 120)
+library(data.table)
+library(ggplot2)
+library(caret)
+library(caTools)
+library(proxy)
+library(kknn)
+library(mlbench)
+
+F1score = function(x, y) {
+  common = intersect(x, y)
+  precision = length(common)/length(x)
+  recall = length(common)/length(y)
+  (2*precision*recall)/(precision + recall)
+}
+```
+
+### Example
+
+In our experiments, we will use a data set called _DNA_ from the _mlbench_ library. It consists of $3186$ data points (splice junctions). The data points are described by $180$ indicator binary variables and the problem is to recognize the $3$ classes (_ei_, _ie_, _neither_), i.e., the boundaries between exons (the parts of the DNA sequence retained after splicing) and introns (the parts of the DNA sequence that are spliced out).   
+
+From the description of data, we know that the most informative features for this set are those in columns _F61_ to _F120_. You can read more about this set by typing _?DNA_ in R console.
+
+```{r dna_data}
+data(DNA)
+relevantFeatures = paste0("F", 61:120)
+
+# data size:
+dim(DNA)
+
+# let's do some data preprocessing
+dataSet = data.table(DNA)
+setnames(dataSet, c(paste0("F", 1:180), "Class"))
+DT = copy(dataSet)  # I'm creating a copy for convenience - this is a very small set
+DT$Class = NULL
+# I'm converting all columns from factors to integers - I'm going to need this later
+DT = DT[, lapply(.SD, as.integer)]
+
+# I create a copy of the classification vector - again, just for convenience
+clsVec = dataSet$Class
+table(clsVec)
+
+numericClasses = integer(length(clsVec))
+numericClasses[clsVec == 'ei'] = 1
+numericClasses[clsVec == 'ie'] = -1
+``` 
+```{r pca_plotting, fig.height = 6, fig.width = 12}
+pca = prcomp(DT)
+
+fig1 <- ggplot(data.table(pca$x), aes(x=PC1, y=PC2, color = clsVec)) +
+  geom_point() + 
+  labs(x = "PC1", y = "PC2", title = "Data visualization - DNA")
+
+bar_plot <- ggplot(data=data.table(id = 1:30, std = pca$sdev[1:30]), aes(x=id, y=std^2)) +
+                   geom_bar(stat="identity", position=position_dodge()) +
+                   labs(title = "Variance of PCs")
+
+gridExtra::grid.arrange(bar_plot, fig1, ncol=2)
+```
+
+Let's conduct a simple experiment - we divide the data into separate training and test sets and check how well a simple prediction algorithm, i.e., _k-NN_ can predict classes of examples from the test set. I'm assuming that you know this algorithm well. __If not, Google it!__
+
+```{r}
+# let's define some division into a training and test set...
+set.seed(12345)
+trainingIdx = sort(sample(1:nrow(dataSet), round(3*(nrow(dataSet)/5))))
+trainingSet = dataSet[trainingIdx,]
+testSet = dataSet[-trainingIdx,]
+clsTr = clsVec[trainingIdx]
+clsTe = clsVec[-trainingIdx]
+
+# and roughly estimate the efficiency of a simple classification model (k-NN)
+knnModel = kknn(Class~., trainingSet, testSet,
+                k = 7, distance = 2, kernel = "triangular")
+cat("Accuracy on the test set:\t", 
+    mean(knnModel$fitted.values == clsTe), "\n", sep = "")
+
+# the confusion matrix
+table(clsTe, knnModel$fitted.values)
+```
+
+### Filtering approach to feature selection
+
+Can we improve this result by selecting good features?    
+
+We may consider various feature ranking methods i.e. the attribute filtering approach. We start from the simplest ones - univariate attribute rankers such as:
+ 
+ - linear correlation,
+ - statistical tests, e.g. t-test, Wilcoxon test, chi2-test
+ - AUC
+ - 'Gain' measures, e.g. InfoGain, GiniGain, discernibility
+
+```{r filter_example1}
+# An Example 1: the correlation filter
+K = 90
+# we simply compute Pearson correlations between attributes and the classification vector
+corrVec = abs(cor(DT[trainingIdx], numericClasses[trainingIdx]))
+head(corrVec)
+
+# now, we select features with the highest absolute value of correlations
+selectedAttrs1 = colnames(dataSet)[order(abs(corrVec), decreasing = TRUE)[1:K]]
+head(selectedAttrs1)
+
+# we may check how many features indicated by experts are in the selected set
+featFound = sum(selectedAttrs1 %in% relevantFeatures)
+cat("The correlation filter found: ", round(100*featFound/60,2), 
+    "% of relevant features\n with F1-score: ", F1score(selectedAttrs1, relevantFeatures), "\n", sep = "")
+
+# now, we can chceck whether the reduction of data dimensionality brings any improvement to predictions
+knnModelFS1 = kknn(Class~., trainingSet[, c(selectedAttrs1, 'Class'), with = FALSE], 
+                   testSet[, ..selectedAttrs1],
+                   k = 7, distance = 2, kernel = "triangular")
+cat("The accuracy on the test set when we use only the selected features is: ", 
+    mean(knnModelFS1$fitted.values == clsTe), "\n", sep = "")
+
+# the confusion matrix
+table(clsTe, knnModelFS1$fitted.values)
+```
+```{r filter_example2}
+#' Some other examples of attribute filters:
+#' wilcox.test-based
+wilcoxTestFS = function(x, dec) {
+  1 - t.test(x[dec == 'ei'], x[dec == 'ie'])$p.value
+}
+
+wilcoxScores = sapply(DT[trainingIdx], wilcoxTestFS, clsTr)
+head(sort(wilcoxScores, decreasing = TRUE))
+
+#' chi2.test-based
+chi2TestFS = function(x, dec) {1 - chisq.test(x, dec)$p.value}
+
+chi2Scores = sapply(DT[trainingIdx], chi2TestFS, clsTr)
+head(sort(chi2Scores, decreasing = TRUE))
+
+#' AUC-based
+aucFS = function(x, dec) {mean(caTools::colAUC(x, dec))}
+
+aucScores = sapply(DT[trainingIdx], aucFS, clsTr)
+head(sort(aucScores, decreasing = TRUE))
+```
+
+### Exercise 1:
+Please try to select top-K features using the above scores. Which seems to be the best one?    
+
+When we have the feature scores, we need to make a decision on which attributes we should choose for the final set. Some common strategies are:
+
+ - take the best K features - the value of K must be decided in advance - how?
+    + we ask an expert ;-)
+    + we use a prediction model (a hybrid with _the wrapper approach_)
+    + we estimate K using _the permutation test_
+ - eliminate features that are weaker than a threshold
+ - for each feature, we estimate a probability that it represents an illusionary dependency with the decision classes - _the permutation test_
+ - use other heuristics, such as the _mRMR_ approach
+
+```{r example3_permutation_test}
+# An example 2: the permutation test
+
+# For each attribute, we create a number of 'random probes' and compute their scores:
+nRand = 1000
+randomProbe_corScores = lapply(DT[trainingIdx], 
+                               function(x,y) replicate(nRand, abs(cor(x, sample(y)))),
+                               numericClasses[trainingIdx])
+  
+# the probability that a random probe obtains at least as high score as the attribute F83 is:
+(sum(randomProbe_corScores[['F83']] >= corrVec['F83', ]) + 1)/(nRand + 2)
+
+# the probability that a random probe obtains at least as high score as the attribute F1 is:
+(sum(randomProbe_corScores[['F1']] >= corrVec['F1', ]) + 1)/(nRand + 2)
+
+# Instead of choosing an arbitrary value of K, we may choose the attributes for which the
+# probability that their score was obtained by a chance is small:
+selectedAttrs2 = colnames(dataSet)[mapply(function(x,randCorrs) x > quantile(randCorrs, 0.995), 
+                                          corrVec, randomProbe_corScores)]
+length(selectedAttrs2)
+
+# How many features indicated by experts we selected this time?
+featFound = sum(selectedAttrs2 %in% relevantFeatures)
+cat("Using the permutation test, we found: ", round(100*featFound/60,2), 
+    "% of relevant features\n with F1-score: ", F1score(selectedAttrs2, relevantFeatures), "\n", sep = "")
+
+# let's check the prediction quality
+knnModelFS2 = kknn(Class~., trainingSet[, c(selectedAttrs2, 'Class'), with = FALSE], 
+                   testSet[, ..selectedAttrs2],
+                   k = 7, distance = 2, kernel = "triangular")
+
+cat("The accuracy on the test set when we use only the selected features is: ", 
+    mean(knnModelFS2$fitted.values == clsTe), "\n", sep = "")
+
+# the confusion matrix
+table(clsTe, knnModelFS2$fitted.values)
+```
+### Relevance, redundancy and optimality
+
+An _optimal_ subset of features for a _model_ is the one that maximizes its performance. There is no simple relation between the _relevance_ of individual features and optimality:   
+
+  - an irrelevant/ redundant feature may be optimal,
+  - a relevant feature may be redundant.
+  
+Consider the following examples (from _Guyon & Elisseeff: An Introduction to Feature Extraction, 2006_)
+  
+![Example 1 (from Guyon & Elisseeff, 2006)](univariate_relevance1.png) 
+![Example 2 (Guyon & Elisseeff, 2006)](univariate_relevance2.png)
+ 
+The feature filters can be _univariate_ (as in the previous example) or _multivariate_, i.e., they may consider features not by themselves, but in the context of other features.
+
+```{r relief_code, echo = FALSE}
+reliefRank = function(dataSet, clsVec, 
+                      sampleSize = min(nrow(dataSet), 1000), proxyLoaded = FALSE)  {
+  if(!proxyLoaded) library(proxy)
+  if(!is.factor(clsVec)) clsVec = factor(clsVec)
+  
+  hitVec = vector("numeric", length=ncol(dataSet))
+  missVec = vector("numeric", length=ncol(dataSet))
+  uniqueDecVec = unique(clsVec)
+  clsIdxList = split(1:nrow(dataSet), clsVec)
+  clsIdxVec = as.integer(clsVec)
+  sampleIdx = sort(sample(1:nrow(dataSet), sampleSize))
+  
+  clsIdxs = clsIdxVec[sampleIdx]
+  for(i in 1:sampleSize)  {
+    tmpIdxs = setdiff(clsIdxList[[clsIdxs[i]]], sampleIdx[i])
+    distVec = as.numeric(proxy::dist(dataSet[sampleIdx[i],], 
+                                     dataSet[tmpIdxs,]))
+    hitIdx = tmpIdxs[which.min(distVec)]
+    distVec = as.numeric(proxy::dist(dataSet[sampleIdx[i],], 
+                                     dataSet[-clsIdxList[[clsIdxs[i]]], ]))
+    missIdx = (1:nrow(dataSet))[-clsIdxList[[clsIdxs[i]]]][which.min(distVec)]
+    rm(distVec)
+    
+    missVec = missVec + abs(dataSet[sampleIdx[i],] - dataSet[missIdx,])
+    hitVec = hitVec + abs(dataSet[sampleIdx[i],] - dataSet[hitIdx,])
+  }
+  
+  rankVec = (missVec/hitVec)
+  return(rankVec)
+}
+```
+```{r example_relief}
+# An example of a multivariate filter is a relief algorithm:
+reliefScores = reliefRank(DT[trainingIdx], clsTr, 100) 
+# the code of this function is hidden - check it in the source of this html
+
+selectedAttrs3 = names(reliefScores)[order(reliefScores, decreasing = TRUE)[1:K]]
+length(selectedAttrs3)
+
+# How many features indicated by experts we found?
+featFound = sum(selectedAttrs3 %in% relevantFeatures)
+cat("Using the relief algorithm, we found: ", round(100*featFound/60,2), 
+    "% of relevant features\n with F1-score: ", F1score(selectedAttrs3, relevantFeatures), "\n", sep = "")
+
+# let's check the prediction quality
+knnModelFS3 = kknn(Class~., trainingSet[, c(selectedAttrs3, 'Class'), with = FALSE], 
+                   testSet[, ..selectedAttrs3],
+                   k = 7, distance = 2, kernel = "triangular")
+
+cat("The accuracy on the test set when we use only the selected features is: ", 
+    mean(knnModelFS3$fitted.values == clsTe), "\n", sep = "")
+
+# the confusion matrix
+table(clsTe, knnModelFS3$fitted.values)
+```
+A different example of a multivariate FS algorithm is the reduct-based ranked from the theory of _rough sets_.
+
+### Evaluation of FS algorithms
+
+How do we measure the performance of a feature selection algorithm? This is a difficult 
+question and we should consider a few aspects of the answer:
+
+ - computation time
+ - size of the resulting feature set (the minimal description length principle)
+ - feature set stability (whether the set of selected features changes a lot when we slightly change our data)
+ - performance of prediction models (the ability to identify valid dependencies in the data)
+ 
+There are several popular methods of testing the FS performance.   
+
+1. The best way - compare the resulting feature sets to the ground truth. Unfortunately, in practice, this is possible only for synthetic data or relatively simple data that can be analyzed by experts.
+2. If we cannot directly compare with the ground truth, then we can at least estimate how often a given algorithm makes obvious errors. One way of doing that is to artificially add a set of random probes to the data before we start our analysis and check what portion of the selected features comes from this set.
+3. We may draw several bootstrap samples of data a empirically check the stability of FS.
+4. We may assess the FS algorithm indirectly by estimating the performance of a prediction algorithm that uses the selected features. **This method requires caution**. We must not use the same data for FS and the estimation!    
+
+Please consider the following experiment.
+
+```{r gollub}
+#' Gollub's experiment
+nRows = 100
+nCols = 10000
+
+# Let's generate some random data...
+dataTab = as.data.frame(matrix(runif(nRows*nCols, -1, 1), nRows, nCols))
+# and a random decision vector
+decisionClasses = sample(c(0,1), nRows, replace = TRUE)
+
+# When we evaluate any prediction algorithm (e.g., using cross-validation), the results are poor...
+predsAll = cv.kknn(decision~., 
+                   cbind(decision = factor(decisionClasses), dataTab), 
+                   kcv = 10, k = 7, distance = 2, kernel = "triangular")
+cat('The accuracy of k-NN using all features is: ', mean(predsAll[[1]][,1] == predsAll[[1]][,2]), '\n')
+
+# We may rank the features using any method, e.g. correlation filter, and select the top 5
+corScores = abs(cor(dataTab, decisionClasses))
+selectedAttrs = order(corScores, decreasing = TRUE)[1:5]
+
+# Now, we can measure the performance of a prediction model using cross-validation
+predsFS = cv.kknn(decision~., 
+                  cbind(decision = factor(decisionClasses), dataTab[, selectedAttrs]), 
+                  kcv = 10, k = 7, distance = 2, kernel = "triangular")
+cat('The accuracy of k-NN with FS is: ', mean(predsFS[[1]][,1] == predsFS[[1]][,2]), '\n')
+```
+
+The accuracy after the feature selection is high, event though there is no relation between the attributes and the classes (they were randomly generated). Obviously, we did something wrong...
+
+### Exercise 2:
+Try to repeat the experiment but this time, conduct the feature selection independently in each iteration of the cross-validation loop. Which result is more realistic? What lesson does it teach?
+
+\
+\
+\
+  
+  
+  

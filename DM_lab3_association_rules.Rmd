@@ -1,0 +1,226 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+  html_document:
+    df_print: paged
+subtitle: Lab3 - mining association rules
+email: a.janusz@mimuw.edu.pl
+---
+
+### The plan:
+
+0. Importing transaction data.
+1. Implementations of frequent set and association rule mining algorithms in R - __arules__ package.
+2. Quality measures for assciation rules.
+3. Vizualization and exploration of rule sets in R.  
+
+```{r setup, results=FALSE}
+options(width = 120)
+library(data.table)
+
+# installation of the required packages (uncomment the line below):
+# install.packages(c("arules", "arulesViz"))
+library(arules)
+library(arulesViz)
+```
+
+### Reading PoS data
+
+There are multiple ways you can read data in the transaction format. The easiest is to read transactions directly from a text file using the _read.transactions_ function, implemented in the _arules_ package. It can read transactions in both of the formats discussed during our previous class:  
+
+ - the _"basket"_ format - each line of a file contains all item ids belonging to the corresponding transaction,
+ - the _"single"_ format - a 2d table where each transaction can be divided into multiple lines, one item per line.
+ 
+ You may also transform any transaction data to the required format using _data.table_ library.
+
+
+```{r transaction_data_reading}
+# let's get back to the exemplary PoS data from previous class
+posData = data.table::fread("sample_pos_data.csv", header = TRUE)
+head(posData)
+
+# we can read this data directly as transactions:
+transactions = arules::read.transactions("sample_pos_data.csv", header = TRUE, format = "single", 
+                                         sep = ",", cols = c("transactionID", "productID"))
+inspect(head(transactions))
+
+# now, we may pring a summary of the data:
+summary(transactions)
+
+# you may also transform transactions into a binary matrix...
+transM = as(transactions, "matrix")
+is(transM)
+dim(transM)
+head(colnames(transM))
+
+# and a binary matrix back into transactions:
+new_trans = as(transM, "transactions")
+is(new_trans)
+```
+
+### Finding frequent itemsets
+
+The _arules_ package allows to efficiently find all frequent itemsets using two different algorithms. The first one is the _apriori_ algorithm which we discussed during our previous meeting. The second one is called _ECLAT_ (Equivalence Class Transformation). You may read more about it in the paper:  
+
+Zaki, M. J. (2000). _"Scalable algorithms for association mining"_. IEEE Transactions on Knowledge and Data Engineering. 12 (3): 372–390.  
+
+While the _apriori_ algorithm searches for frequent itemsets in a breadth-first fashion, ECLAT is an example of a depth-first approach, thus it can be more efficient for some data sets.
+
+```{r frequent_itemsets}
+# let's use the same data set as the last time
+data(Epub)
+summary(Epub)
+
+# generating frequent itemsets using the apriori algorithm
+# (this is an efficient implementation which uses prefix trees to speed up support counting):
+minSupport = 0.001         # this is a quite low value but it is only used for a demonstration
+frequentItemSets = apriori(Epub, 
+                           parameter = list(supp = minSupport, 
+                                            minlen = 2, 
+                                            target = "frequent itemsets"),
+                           appearance = NULL, control = list(verbose = FALSE))
+summary(frequentItemSets)
+frequentItemSets = sort(frequentItemSets, decreasing = TRUE, by = "support")
+
+# 'inspect' is the method for displaying itemsets and rules:
+inspect(frequentItemSets[which(size(frequentItemSets) == 3)])
+
+# we may generate the same itemsets using the ECLAT algorithm:
+frequentItemSetsEclat = eclat(Epub, parameter = list(supp = minSupport, 
+                                                     minlen = 2, 
+                                                     target = "frequent itemsets"),
+                              control = list(verbose = FALSE))
+summary(frequentItemSetsEclat)
+frequentItemSetsEclat = sort(frequentItemSetsEclat, decreasing = TRUE, by = "support")
+
+# let's check the itemset of size 3:
+inspect(frequentItemSetsEclat[which(size(frequentItemSetsEclat) == 3)])
+```
+### Association rules
+
+To create association rules from frequent itemsets, we need to set a value of additional quality criteria, i.e., __confidence__. If we define the support of an itemset $X$ in a set of transactions $T$ as $$supp(X) = \frac{\|\{t \in T: X \subseteq t\}\|}{\|T\|},$$ then the confidence of an association rule $X \Rightarrow Y$ is $$conf(X \Rightarrow Y) = \frac{supp(X \cup Y)}{supp(X)}.$$
+
+In practice, we usually do not expect that the confidence of discovered association rules is going to be very high. Please note that even $conf = 0.1$ can be meaningful when the support of $X$ is relatively high, but the support of $Y$ is low. In such a case, we may discover that the presence of $X$ dramatically increases the probability of the occurrence of $Y$ - which can be valuable information (think about the problem of up-sell).  
+
+For this reason, it is convenient to use other association rule quality metric. One that is particularily popular is called __lift__: $$lift(X \Rightarrow Y) = \frac{supp(X \cup Y)}{supp(X) \times supp(Y)} = \frac{conf(X \Rightarrow Y)}{supp(Y)}.$$
+
+```{r association_rules}
+# we may generate association rules from frequent itemsets:
+eclatRules = ruleInduction(frequentItemSetsEclat, Epub, confidence = 0.6, 
+                           control = list(method = "apriori", verbose = FALSE))
+
+inspect(eclatRules)
+
+# we may also compute the rules directly using the apriori function - let's compute some more rules
+ruleSet = apriori(Epub, parameter = list(supp = minSupport/2, 
+                                         conf = 0.2,
+                                         minlen = 2,
+                                         target = "rules"),
+                  appearance = NULL, 
+                  control = list(sort = -1, verbose = FALSE))
+
+summary(ruleSet)
+
+# we may sort the rules by any metric
+ruleSet = sort(ruleSet, decreasing = TRUE, by = "lift")
+inspect(ruleSet[1:5])
+
+# to get a data.frame with quality metrics we can use the 'quality' method:
+inspect(ruleSet[which.max(quality(ruleSet)[["support"]])])
+
+head(quality(ruleSet))
+
+# we may compute some more metrics if we want to:
+ruleSet = apriori(Epub, parameter = list(supp = minSupport/2, 
+                                         conf = 0.2, 
+                                         minlen = 2, 
+                                         arem = "chi2",
+                                         target = "rules", 
+                                         ext = TRUE,
+                                         minval = 0,
+                                         aval = TRUE),
+                  appearance = NULL, 
+                  control = list(sort = -1, verbose = FALSE))
+summary(ruleSet)
+
+# we can also compute only specific type of rules, e.g., those which have item "doc_71" in the right-hand side part
+ruleSet_doc_71 = apriori(Epub, parameter = list(supp = minSupport/2, 
+                                                conf = 0.2,
+                                                minlen = 2,
+                                                target = "rules"),
+                         appearance = list(rhs = "doc_71"), 
+                         control = list(sort = -1, verbose = FALSE))
+inspect(ruleSet_doc_71)
+```
+
+It might be useful to know how to effectively explore an association rule set. 
+
+```{r exploration, fig.hold='hold', out.width="100%"}
+rules = ruleSet
+
+# we may want to filter out some rules:
+maxRules = 100
+
+ruleSet = sort(ruleSet, by = "lift")
+ruleSet = ruleSet[1:maxRules]
+summary(ruleSet)
+
+# we may apply some additional filters
+ruleSet = subset(ruleSet, subset = ((confidence > 0.9 & lift > 200) | size(ruleSet) > 4))
+summary(ruleSet)
+
+# We may also explore the rule set interactively (it will not work in the notebook - try it yourself in R session):
+ruleSet = rules
+plot(ruleSet[1:1000], engine='htmlwidget', shading = "chi2")
+```
+```{r exploration_plotting, fig.hold='hold', out.width="100%", fig.width=10}
+# some nice plots
+plot(ruleSet, data = Epub, method = "grouped", engine='default', shading = "lift")
+
+plot(ruleSet[1:100], data = Epub, method="graph", engine="htmlwidget", shading = "lift")
+
+plot(ruleSet[1:100], data = Epub, method="matrix", engine="htmlwidget", shading = c("lift", "confidence"))
+```
+
+### Exercise:
+
+A link to the cosmetics data set:  
+https://drive.google.com/file/d/1dbpYjIN3ArP2NZgviGWNiTIDj3KoitCf/view?usp=sharing
+
+```{r real_life_data}
+# now, let's investigate some real-life PoS data
+cosmeticsData = data.table::fread('cosmeticsData.csv', sep = ',', header = TRUE) # the data set is available in the Drive
+str(cosmeticsData)
+
+# some of the data, including product ids, is missing...
+cosmeticsData[, any(is.na(productID))]
+data.table::fwrite(cosmeticsData[!is.na(productID)], file = 'cosmeticsData_cleaned.csv', 
+                   col.names = TRUE, sep = ',', na = 'NA')
+
+# we may also read the data as transactions:
+cosmeticsTransactions = arules::read.transactions('cosmeticsData_cleaned.csv', 
+                                                  sep = ',', format = 'single', 
+                                                  cols = c('transactionID', 'productID'),
+                                                  rm.duplicates = TRUE, header = TRUE)
+inspect(head(cosmeticsTransactions))
+```
+
+
+**The task:**  
+Please investigate this data set and find interesting association rules. Play with data visualization.    
+Can you discover any interesting patterns?    
+For instance, please try to add to each transaction the ID of a sales person (if it is available). Can you find any interesting associations that involve the sales personnel?    
+Can you discover any relation between sales and time?    
+
+\
+\
+\
+  
+  
+  
