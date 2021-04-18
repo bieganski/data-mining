@@ -7,8 +7,13 @@ set -x
 
 data_fname=clash_royale_games_Jan_2019.csv
 
-num=100000
-res_fname="winning.csv"
+num=1000000
+res_fname="res.csv"
+
+if ! [ -f $data_fname ]; then
+	echo "error: data $data_fname doesn't exists!"
+	exit 1
+fi
 
 if [ -f $res_fname ]; then
 	echo "error: $res_fname already exists!"
@@ -17,8 +22,6 @@ fi
 
 
 header=`head -n 1 $data_fname`
-
-
 
 BASIC=0
 WINNING=0
