@@ -1,0 +1,310 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+subtitle: Lab8 - text mining basics
+email: janusza@mimuw.edu.pl
+---
+
+### The plan:
+
+1. Basic operations on character strings.
+2. Tokenization, stemming, POS tagging.
+3. Bag-of-words, vector representations of texts, _tf-idf_.
+4. Example: document clustering.  
+
+```{r setup, results=FALSE}
+options(width = 120)
+library(openNLP)
+library(SnowballC)
+library(NLP)
+library(tm)
+library(Matrix)
+library(slam)
+library(SparseM)
+library(skmeans)
+```
+
+### Reading texts
+
+There are numerous ways in which it is possible to read texts in R. The most basic are functions _readLines_ and _scan_.    
+
+Let's try to read some exemplary documents -- abstracts of scientific articles from ACM Digital Library. You can download them from my GDrive:  
+https://drive.google.com/file/d/1qiDVKkSGZFbWUSekKEH1T6f6cbT1W_vN/view?usp=sharing  
+
+
+```{r data_read, results = TRUE, message=FALSE, warning=FALSE}
+# I'm assuming that the docs are located in this directory:
+docsDir = "docs"
+
+# we first get the list of file names
+docsNames = dir(file.path(getwd(), docsDir))
+length(docsNames)
+is.unsorted(docsNames)
+
+# then we simply read the docs in a loop
+docsList = list()
+for(i in 1:length(docsNames)) docsList[[i]] = scan(file.path(docsDir, docsNames[i]), quote = "'",
+                                                   what = character(), quiet = TRUE, allowEscapes = FALSE)
+
+# if we know the encoding, we can set it using "Encoding" function
+docsList = sapply(docsList, function(x) {Encoding(x) = "UTF-8"; x})
+head(docsList[[83]], 20)
+``` 
+```{r basic_operations}
+# concatenation of texts - function paste
+paste(docsList[[83]][1], docsList[[83]][2], docsList[[83]][3], sep = " ")
+paste(docsList[[83]], collapse = " ")
+
+# regular expressions - in R we can use them in two different styles (Perl-like and extended regular expressions - the default) 
+# read more about regular expressions in the manual: ?regexp
+sentence1 = paste(docsList[[83]][1:grep("[.]", docsList[[83]])[1]], collapse = " ")
+sentence1
+
+# regular expressions can be extremely useful
+sentence1 = sub(":", " - ", sentence1)
+sentence1 = sub("a\\>", " ", sentence1)
+sentence1 = sub("[.]", " ", sentence1)
+sentence1
+
+sentence = gsub("[[:space:]]+", " ", sentence1)
+sentence = sub("[[:space:]]$", "", sentence)
+sentence
+
+# text splitting - function strsplit
+words = strsplit(sentence, "[[:space:]]")
+words = words[[1]]                           # the result is always a list!
+words
+
+# counting letters - function nchar
+head(sapply(words, length))    # length is always 1...
+head(sapply(words, nchar))     # looks good
+```
+### Exercise 1
+To practice basics of text manipulation in R, please do the following simple exercise:    
+Divide the words from _words_ vector into vectors of single characters and then, concatenate them into vectors of 2-shingles (only for words with 2+ characters), e.g., tries -> t r i e s -> tr ri ie es
+
+```{r exercise1}
+# put your code for the exercise here
+```
+
+There are also many standard NLP tools available. You can use them to augment your texts for so-called deep analysis (do not confuse it with deep learning).
+
+```{r basic_nlp}
+# basic text transformations, such as changing the capitalization of letters is easy
+sentence = tolower(sentence)
+sentence
+
+# to perform text tokenization we need to transform our texts to a class that is an extension to character type, i.e., String
+myText = as.String(docsList[[83]])
+
+# it has a totally different indexing method!
+myText[1,15]
+myText[1,20]
+
+# now, we may tag sentences, words, and parts-of-speech
+annotatedText = annotate(myText,
+                         list(Maxent_Sent_Token_Annotator(),
+                              Maxent_Word_Token_Annotator(),
+                              Maxent_POS_Tag_Annotator()))
+head(annotatedText, 30)    # it works reasonably well, I guess...
+# you can find a list of all possible POS tags and their meaning here:
+# https://www.ling.upenn.edu/courses/Fall_2007/ling001/penn_treebank_pos.html
+
+# it is important to remember that annotations must be done in a specific order
+sentences = annotate(myText, Maxent_Sent_Token_Annotator())
+sentences
+# but if you try to run annotate(myText, Maxent_Word_Token_Annotator()) 
+# you get an error - it is necessary to annotate sentences first
+```
+
+Another way of text transformation is word stemming. A stem is the 'core' of a word. For some languages (e.g. Polish), we can also find lemmas of words (their basic forms).
+
+```{r}
+# stemming
+head(words)
+head(stemDocument(words))
+
+# we also often want to remove frequent words (i.e. stop-words)
+str(stopwords())     # a list of the most common English words
+
+length(words)
+sum(words %in% stopwords())
+words[words %in% stopwords()]
+
+# now, we can build a standard text preprocessing pipline:
+# for each document, we divide it into words, remove punctation, digits and duplicated white characters
+# we also remove stop-words and words with less than 3 or more than 20 characters
+# in the end, we do the stemming
+stemmedDocsList = lapply(docsList, function(x) gsub("[[:punct:][:digit:][:space:]]+", " ", x))
+stemmedDocsList = lapply(stemmedDocsList, function(x) unlist(strsplit(x, "[[:space:]]")))
+stemmedDocsList = lapply(stemmedDocsList, function(x) gsub("[[:space:]]+", "", x))
+stemmedDocsList = lapply(stemmedDocsList, tolower)
+stemmedDocsList = lapply(stemmedDocsList, function(x) {idx = which(nchar(x) < 3 | nchar(x) > 20 | is.na(nchar(x))); 
+                                                       if(length(idx) > 0) x <- x[-idx];
+                                                       x})
+stemmedDocsList = lapply(stemmedDocsList, function(x, dict) {idx = which(x %in% dict); 
+                                                             if(length(idx) > 0) x[-idx]}, 
+                         stopwords())
+stemmedDocsList = lapply(stemmedDocsList, stemDocument)
+
+head(stemmedDocsList[[83]], 16)
+```
+### Representations of textual data
+
+The most common representation of texts is, so called, _bag-of-words_.
+
+```{r bag_of_words}
+# "bags-of-words": we simply count occurrences of each term n the text
+bagOfWords = table(stemmedDocsList[[83]])
+head(bagOfWords, 10)
+
+# we may want to normalize the frequencies with regard to text lengths
+bagOfWords = bagOfWords/sum(bagOfWords)
+head(bagOfWords, 10)
+```
+
+But how can we represent a whole collection of texts? We need to create a dictionary of possible terms and represent each document by counts of terms from the dictionary. However, there are better ways to quantify the relevance of individual terms to a given document. One of the most common is called _TF-IDF_ i.e. Term Frequency - Inverted Document Frequency.    
+
+For a single token in a text corpora, its _TF-IDF_ is a product of the term frequency frequency and a logaritm of $\frac{1}{\mbox{frequency of texts containing this word in the corpora}}$.
+
+### Exercise 2
+Compute the _TF-IDF_ vector for terms of our _bagOfWords_.
+
+```{r exercise2}
+# put your code for the exercise here
+```
+
+```{r dense_rep}
+# let's consider exemplary representation of a document
+termDict = unique(unlist(stemmedDocsList))
+termDict = termDict[order(termDict)]
+
+length(termDict)                # pleasee note the size of this vector
+
+vectorRep = numeric(length(termDict))
+names(vectorRep) = termDict
+vectorRep[names(bagOfWords)] = bagOfWords
+
+# only a small fraction of terms have greater than zero weights
+sum(vectorRep > 0)                                
+sum(vectorRep > 0)/length(vectorRep)              
+```
+
+It is more efficient to store the representations of documents in a special format which is suited for sparse data. Often in such cases, it is necessary to adjust machine learning algorithms to work with the sparse data format.    
+
+Implementations of sparse matrices in R are in packages: _Matrix_, _slam_, _SparseM_.
+
+```{r sparse_rep}
+#' we may create a custom representation
+makeSparse = function(stemRep, terms)  {
+  numVec = table(stemRep)
+  numVec = numVec/sum(numVec)
+  idxVec = which(terms %in% names(numVec))
+  attr(numVec, "idx") = idxVec
+  return(numVec)
+}
+
+vectorDocsList = lapply(stemmedDocsList, function(x,terms) {tmp = table(x);
+                                                            tmp = tmp/sum(tmp);
+                                                            vec = numeric(length(terms));
+                                                            names(vec) = terms
+                                                            vec[names(tmp)] = tmp;
+                                                            vec}, termDict)
+sparseDocsList = lapply(stemmedDocsList, makeSparse, termDict)
+
+head(sparseDocsList[[1]], 16)
+head(attr(sparseDocsList[[1]], "idx"), 16)
+
+# let's check object sizes
+# original stemmed docs
+object.size(stemmedDocsList)
+# dense vectors
+object.size(vectorDocsList)
+# sparse vectors
+object.size(sparseDocsList)
+
+# we can also use the EAV representation
+entityVec = unlist(mapply(function(x, y) rep(x, length(y)), 
+                          1:length(sparseDocsList), sparseDocsList,
+                          SIMPLIFY = FALSE))
+attributeVec = unlist(lapply(sparseDocsList, attr, "idx"))
+valueVec = unlist(sparseDocsList)
+
+docsMatrix = simple_triplet_matrix(entityVec, attributeVec, valueVec)
+dim(docsMatrix)
+# representation as document-term matrix
+object.size(docsMatrix)
+
+#' the same for a 'dense' matrix:
+denseDocsMatrix = as.matrix(docsMatrix)
+dim(denseDocsMatrix)
+object.size(denseDocsMatrix)
+
+#' sparse matrix format supports the most of typical algebraic operations:
+docsMatrix[1, 338:340]
+as.matrix(docsMatrix[1, 338:340])
+
+2*docsMatrix[1, 338:340] + matrix(rep(3, 3), nrow = 1)
+as.matrix(2*docsMatrix[1, 338:340] + matrix(rep(3, 3), nrow = 1))
+
+#' another representation from the package SparseM:
+docsMatrix2 = as.matrix.csr(denseDocsMatrix)
+dim(docsMatrix2)
+object.size(docsMatrix2)
+
+docsMatrix2[1, 338:340]
+as.matrix(docsMatrix2[1, 338:340])
+
+#' an easier way to create a sparse matrix:
+docsMatrix3 = sparseMatrix(i = entityVec, j = attributeVec, x = valueVec)
+dim(docsMatrix3)
+object.size(docsMatrix3)
+```
+
+### Clustering of textual data
+
+Since typical document representation is sparse, and thus high dimensional, we usually use a distance metric that is less prone to the curse of dimensionality, such as the cosine distance. An additional advantage of this metric is the fact that it can be computed much more efficiently for sparse vector representations. 
+
+```{r clustering}
+# 'regular' kmeans clustering:
+system.time({
+  docsClusters1 = kmeans(denseDocsMatrix, centers = 3, iter.max = 50, nstart = 10) 
+})
+
+table(docsClusters1$cluster)
+docsClusters1$withinss
+docsClusters1$totss
+
+#' spherical kmeans is using the cosine similarity
+system.time({
+  docsClusters2 = skmeans(docsMatrix, k = 3, method = "pclust",
+                          control = list(nruns = 10, reltol = 0.005)) 
+})
+
+table(docsClusters2$cluster)
+
+rm(list = ls())
+```
+
+### Exercise 3
+Visualize and compare the above clustering results.
+
+```{r exercise3}
+# put your code for the exercise here
+```
+
+
+\
+\
+\
+  
+  
+  

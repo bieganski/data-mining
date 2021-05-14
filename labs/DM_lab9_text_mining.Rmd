@@ -1,0 +1,302 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+subtitle: Lab9 - text mining in R (part 2)
+email: janusza@mimuw.edu.pl
+---
+
+### The plan:
+
+1. Bag-of-words, vector representation of texts, _tf-idf_ and _DTMs_  - implementations from _tm_ package.
+2. LSA and LDA.
+3. Classification of textual data.
+
+```{r setup, results=FALSE, message=FALSE, warning=FALSE}
+options(width = 120)
+library(openNLP)
+library(SnowballC)
+library(NLP)
+library(tm)
+library(Matrix)
+library(textmineR)
+library(uwot)
+library(RSpectra)
+library(e1071)
+library(caTools)
+library(ggplot2)
+```
+
+Last time we learned how to use basic R text manipulation functions to process textual data and prepare vector representations of documents. This time, we will focus on more advanced _out-of-the-box_ R methods for processing texts.    
+
+A basic data structure for storing textual documents in R is _Corpus_. 
+
+```{r}
+# we are going to use the same example as previously
+docsDir = "docs"
+
+# to get familiar with the Corpus data structure type:
+# ?Corpus
+
+# VCorpus can be used as an advanced reader for textual data
+myCorpus = VCorpus(DirSource(file.path(getwd(), docsDir), encoding = "UTF-8"), 
+                   readerControl = list(reader = readPlain, language = "en"))
+
+# there is plenty of different reader available for various document formats. 
+# You may use them instead of readPlain if it is needed
+getReaders()
+
+length(myCorpus)
+
+# to investigate particular document use the 'content' method
+str(content(myCorpus[[83]]))
+# you could get the same effect by using as.character()
+
+# you can get the vector of terms using the 'words' method
+head(words(myCorpus[[83]]), 10)
+
+# there are also methods like 'sents', 'paras', etc., but they only work with annotated text
+sent_annotation = NLP::annotate(myCorpus[[83]], Maxent_Sent_Token_Annotator())
+myDoc = AnnotatedPlainTextDocument(myCorpus[[83]], sent_annotation, meta = meta(myCorpus[[83]]))
+
+annotation(myDoc)
+```
+It is easy to implement advanced text processing pipelines using the _tm_map_ method. 
+
+```{r}
+# a list of pre-built text transformers:
+getTransformations()
+
+# you can always add a new one
+correctEnc = function(x) {
+  stringr::str_replace_all(x,"[^[:graph:]]", " ")
+}
+
+# using custom transformers
+myCorpus = tm_map(myCorpus, content_transformer(correctEnc))
+myCorpus = tm_map(myCorpus, content_transformer(tolower))
+
+# using 'standard' transformers (one-by-one)
+myCorpus = tm_map(myCorpus, removeNumbers)
+myCorpus = tm_map(myCorpus, removePunctuation)
+myCorpus = tm_map(myCorpus, removeWords, stopwords())
+myCorpus = tm_map(myCorpus, stemDocument)
+myCorpus = tm_map(myCorpus, stripWhitespace)
+
+content(myCorpus[[83]])
+
+# it is possible to combine many transformers using 'tm_reduce' method
+```
+
+An object of the class _Corpus_ can be easily transformed into a document-term matrix (or term-document matrix).
+
+```{r}
+# we can select one of several available weighting schemes or provide a custom function to compute the term weights
+# we can also filter out some very common or rare terms
+DTM = DocumentTermMatrix(myCorpus, 
+                         control = list(bounds = list(global = c(2, length(myCorpus))),
+                                        weighting = weightTfIdf))
+
+is(DTM)
+dim(DTM)
+
+# we can investigate the weights using the inspect method - indexing is the same as for a regular matrix
+inspect(DTM[1:5,1:10])
+# we can also index using term names...
+inspect(DTM[1:100, "best"])
+# or using document identifiers
+inspect(DTM["997709.txt", 1:100])
+
+# of course, internally, this is a sparse matrix
+object.size(DTM)
+
+# analogically, we could compute the term-document matrix using the 'TermDocumentMatrix' function
+```
+
+### Text classification - topic prediction
+
+As an example of a text mining task, we may consider the problem of topic classification of textual data.
+
+```{r}
+# let's load labels for our documents:
+clsVec = readLines("doc_classes.csv")
+
+# a nearly balanced decision problem:
+table(clsVec)
+
+# we can visualize the data using UMAP:
+data_umap = uwot::umap(as.matrix(DTM), metric = "cosine", n_neighbors = 10)
+# there is also an alternative package called 'umap' - it is a port to Python's umap-learn
+
+ggplot(data.frame(data_umap), aes(x=X1, y=X2, colour = clsVec)) +
+    geom_point(shape=1) + labs(x = "X", y = "Y")
+
+# we can divide the data into a training and a test set (we take the 50:50 proportion)
+set.seed(123)
+trIdx = sort(sample(nrow(DTM), 1000))
+
+# now, we train a prediction model that can take advantage of the data sparsity
+svmModel = e1071::svm(DTM[trIdx, ], factor(clsVec[trIdx]), 
+                      type = 'C-classification', 
+                      kernel = 'linear', cost = 1,
+                      probability = TRUE)
+
+# how does it perform?
+predictions = predict(svmModel, DTM[-trIdx, ], probability = TRUE)
+
+# as an evaluation metric we use AUC
+colAUC(attr(predictions, 'probabilities')[, 1], clsVec[-trIdx])
+# can we do better than that?
+```
+
+### LSA (also called LSI)
+
+The LSA (Latent Semantic Analysis/Indexing) technique uses SVD of the DTM matrix.
+We regard the columns of V matrix as representations of '_concepts_' hidden (latent) in our data.
+The importance of those concepts is expressed by the eigenvalues.
+The matrix V describes a relation between the concepts and columns of DTM, i.e. terms from our data. Analogically, U expresses the relation between documents and the latent concepts. Please, recall the very same interpretation that we used for a recommender system.
+
+```{r}
+# Let's compute SVD and measure the required time
+system.time({
+  SVD = svd(DTM)
+})
+
+# the 'importance' of concepts drops very fast 
+plot(head(SVD$d, 50), ylab = 'eigenvalues')
+
+# Let's investigate the concepts.
+dim(SVD$v)
+
+# Lets have a look at the representation of the first concept:
+concept1 = SVD$v[,1]
+summary(concept1)
+concept1 = -concept1
+names(concept1) = Terms(DTM)
+
+concept1 = sort(concept1, decreasing = TRUE)
+concept1[1:10]
+
+# Now, lets investigate another one:
+concept2 = SVD$v[,2]
+concept2 = -concept2
+names(concept2) = Terms(DTM)
+
+concept2 = sort(concept2, decreasing = TRUE)
+concept2[1:10]
+# some of the terms have negative impact on our concept
+tail(concept2)
+
+# The concepts 1 and 2 are complementary:
+round(SVD$v[,1] %*% SVD$v[,2], 10)
+
+concept10 = SVD$v[,10]
+concept10 = -concept10
+names(concept10) = Terms(DTM)
+
+concept10 = sort(concept10, decreasing = TRUE)
+concept10[1:10]
+
+# We can now create (very naive) names of concepts
+takeNames = function(x, xNames, n = 5) {
+  if(abs(max(x)) < abs(min(x))) x = -x
+  names(x) = xNames
+  idx = order(abs(x), decreasing = TRUE)
+  signs = rep("+", n)
+  signs[sign(x[idx[1:n]]) < 0] = "-"
+  
+  paste(paste0(signs, names(x)[idx[1:n]]), collapse = "_")
+}
+
+conceptNames = apply(SVD$v, 2, takeNames, Terms(DTM), n = 6)
+head(conceptNames)
+
+```
+
+A more efficient way of computing the eigenvectors is implemented in the library _irlba_. Alternatively, you may also use the _RSpectra_ package (which sometimes can be a better choice).
+
+```{r}
+# we need to convert the data to a different format - if you have a lager DTM, it wouldn't work!
+DTM2 = Matrix::Matrix(as.matrix(DTM), sparse = TRUE)
+
+#' we may compute a partial SVD
+system.time({
+  SVD_alt = RSpectra::svds(DTM2, k = 100, nu = 100, nv = 100)
+})
+
+SVD$v[1:10,2]
+SVD_alt$v[1:10,2]
+
+# we have a very similar result:
+all(round(abs(SVD$v[, 1:10]), 8) == round(abs(SVD_alt$v[, 1:10]), 8))
+```
+### Exercise 1
+Please try to represent the documents in the concept space and train a new prediction model. Compare its performance with the model trained on the original data. Remember to convert the concept representation into a _simple_triplet_matrix_ before computing SVMs.
+
+```{r exercise1}
+# put your code for the exercise here
+```
+
+
+### Latent Dirichlet Allocation (LDA)
+
+An alternative method for representing documents in a _conceptual space_ is called LDA. The general idea is similar:
+
+ - We assume that every document is a mixture of topics (concepts),
+ - and every topic is a mixture of words.
+ 
+LDA is a method for estimating both of these at the same time: finding the mixture of words that is associated with each concept, while also determining the mixture of concepts that describes each document.
+
+```{r}
+# we use the implementation of LDA from the textmineR package (it's quite efficient)
+# to do that, the input needs to be a 'dgCMatrix' sparse matrix with term counts
+DTM3 = DocumentTermMatrix(myCorpus, 
+                          control = list(bounds = list(global = c(2, length(myCorpus))),
+                                         weighting = weightTf))
+DTM3 = Matrix::Matrix(as.matrix(DTM3), sparse = TRUE)
+
+
+# we model the data using 20 hidden topics - we train only on the training documents
+LDA_model = textmineR::FitLdaModel(DTM3[trIdx, ], k = 20, 
+                                   iterations = 500, burnin = 450)
+
+# we may estimate the topics of remaining documents using the predict method
+test_topics_gibbs = predict(LDA_model, DTM3[-trIdx, ], method = "gibbs",
+                            iterations = 500, burnin = 450)
+
+test_topics_dot = predict(LDA_model, DTM3[-trIdx, ], method = "dot")
+
+# comparison of predictions:
+barplot(rbind(test_topics_gibbs[1,], test_topics_dot[1,]), 
+        beside = TRUE, col = c("red", "blue"))
+
+# or we could also compute LDA on whole data...
+LDA_model = textmineR::FitLdaModel(DTM3, k = 20, 
+                                   iterations = 500, burnin = 450)
+
+
+# extracting top k terms for each topic
+GetTopTerms(LDA_model$phi, 6)[, 1:10]
+```
+
+### Exercise 2:
+Can you fit the SVM model using the topic representation from LDA? Play with the parameter _k_ and find a topic space that is good for making predictions. Compare the results to those which you obtained using SVD. Which are better? Can you combine those representations?
+
+```{r exercise2}
+# put your code for the exercise here
+```
+
+
+\
+\
+\
+  
+  
+  

@@ -1,0 +1,222 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz"
+output:
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+subtitle: Lab10 - text representation learning
+email: janusza@mimuw.edu.pl
+---
+
+### The plan:
+
+1. Word2vec - _skip-grams_ and _CBOWs_.
+2. Embeddings of documents.
+3. Return to classification of textual data.
+4. _GloVe_ embeddings.
+
+```{r setup, results=FALSE, message=FALSE, warning=FALSE}
+options(width = 120)
+library(tm)
+library(data.table)
+# devtools::install_github("bmschmidt/wordVectors")
+library(wordVectors)
+library(text2vec)
+library(uwot)
+library(FNN)
+library(ggplot2)
+library(foreach)
+library(doParallel)
+
+F1score = function(x, y) {
+  common = intersect(x, y)
+  result = 0
+  if(length(common) == 0) {
+    result = 0
+  } else {
+    result = 2*(length(common)^2)/(length(x)*length(y))/(length(common)/length(x) + length(common)/length(y))
+  }
+  
+  as.numeric(result)
+}
+
+nn_predictions = function(tr_data, te_data, tr_target) {
+  
+  knn_model = FNN::get.knnx(tr_data, te_data, k=1, algorithm="kd_tree")
+  
+  index_test = knn_model$nn.index
+
+  # validation score:
+  preds_te = tr_target[index_test]
+  
+  # produce results:
+  list(model = knn_model, te_preds = preds_te, K = 1)
+}
+```
+
+During previous classes you learned various representations of textual data. This time we will create a different type of representation which is based on a technique known as _word2vec_. You may read more about this approach, e.g. here: https://en.wikipedia.org/wiki/Word2vec
+
+Two main methods for training the word2vec model are _skip-gram_ and _CBOW_. In the first one, we train a simple NN to predict a context word based on a given word. In the second one, we also train a NN, but this time we want to guess a word based on context words.
+
+You can get the data for the example below from my GDrive:
+https://drive.google.com/file/d/14Kqq_GybX_TZM8qRuxJ8VUh1MLjH7NS4/view?usp=sharing
+
+```{r}
+# let's use a sample of abstracts of scientific papers stored in ACM digital library:
+docs = data.table::fread('DM_ACM_docs_and_labels.txt', header = FALSE, sep = "\t", encoding = "UTF-8")
+dim(docs)
+
+docs[1]
+setnames(docs, c("doc_id", "text", "labels"))
+
+# we need to do some basic text cleaning but typically, we do not stem words and remove stop-words
+docs[, text := gsub("[<][^<>]+[>]", "", text)]
+docs[, text := gsub("[^[:alpha:]\']+", " ", text)]
+docs[, text := tolower(text)]
+
+# this method is using a streaming API so we can write the documents to disc and save memory
+writeLines(docs[, text], "docs_for_training.txt")
+```
+
+Now, we are ready to train a CBOW model.
+```{r, results = FALSE, eval=FALSE}
+# it may take some time...
+word_vectors_cbow <- train_word2vec("docs_for_training.txt",
+                                    "words_cbow_size100.bin",
+                                    vectors=100, threads=6, window=5, iter=20, 
+                                    negative_samples=5, cbow = 1, force = TRUE)
+```
+
+Since the computations may take some time, I provide a link to my results:
+https://drive.google.com/file/d/1rQp3AtrbrgYrljZjraabpDJW42KrWl96/view?usp=sharing
+
+```{r, message=FALSE}
+sink("sink_file")
+word_vectors_cbow <- read.binary.vectors("words_cbow_size100.bin")
+sink(NULL)
+
+is(word_vectors_cbow)
+head(word_vectors_cbow)
+
+# we may investigate similarity of words to check whether the model is reasonable
+closest_to(word_vectors_cbow, "algorithm")
+# looks good...
+```
+
+Now, lets train a similar word model using the skip-gram approach.
+
+```{r, results = FALSE, eval=FALSE}
+# it may take even more time...
+word_vectors_skipgram = train_word2vec("docs_for_training.txt",
+                                       "words_skipgram_size100.bin",
+                                       vectors=100, threads=6, window=10, iter=10, 
+                                       negative_samples=5, cbow = 0, force = TRUE)
+```
+Again, you may download the results here:
+https://drive.google.com/file/d/12Y3zSK9cnAcfYw39xR9U9mPrVMjDjrZN/view?usp=sharing
+
+```{r}
+sink("sink_file")
+word_vectors_skipgram <- read.binary.vectors("words_skipgram_size100.bin")
+sink(NULL)
+
+is(word_vectors_skipgram)
+head(word_vectors_skipgram)
+
+# again, let's check whether the model is reasonable
+closest_to(word_vectors_skipgram, "algorithm")
+# looks good (even better?)...
+```
+
+You may want to compere the results with a case when the word stemming was performed before the computation of word2vec...
+
+```{r}
+# let's visualize the embeddings using UMAP:
+word_umap = uwot::umap(matrix(word_vectors_skipgram, ncol = 100), 
+                       metric = "cosine", n_neighbors = 10)
+
+ggplot(data.frame(word_umap), aes(x=X1, y=X2, label = rownames(word_vectors_skipgram))) +
+    geom_point(shape=1) + labs(x = "X", y = "Y")
+
+```
+
+How can we embedd whole documents? The simplest way is to aggregate the embeddings of individual words. Remember, however, that there are also more sophisticated methods.
+
+```{r}
+# For example, the embedding of the first document would be:
+words = docs[1, strsplit(text, " ")[[1]]]
+
+embedding = word_vectors_cbow[[words]]
+embedding
+
+head(as.numeric(embedding))
+
+# the matrix that stores embeddings of all documents can be large:
+doc_embeddings = sapply(strsplit(docs[, text], " "), 
+                        function(x, word_embedds) word_embedds[[x]],
+                        word_vectors_skipgram)
+doc_embeddings = t(doc_embeddings)
+```
+
+```{r glove}
+texts <- readLines("docs_for_training.txt")
+
+# Create iterator over tokens
+tokens <- space_tokenizer(texts)
+# Create vocabulary. Terms will be unigrams (simple words).
+it = itoken(tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it)
+
+vocab <- prune_vocabulary(vocab, term_count_min = 5L)
+
+# Use the filtered vocabulary
+vectorizer <- vocab_vectorizer(vocab)
+# use window of 5 for context words
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+
+# fit the model
+glove = GlobalVectors$new(rank = 50, x_max = 10)
+glove_word_vectors <- glove$fit_transform(tcm, n_iter = 20)
+
+algorithm <- glove_word_vectors["algorithm", , drop = FALSE]
+cos_sim = sim2(x = glove_word_vectors, y = algorithm, method = "cosine", norm = "l2")
+head(sort(cos_sim[,1], decreasing = TRUE), 10)
+```
+
+Can you create a prediction model based on the word2vec embeddings?
+
+```{r}
+labels <- strsplit(docs[, labels], ",")
+labels <- data.table(doc_id = rep(1:length(labels), times = sapply(labels, length)),
+                    label = unlist(labels))
+labels[, value := 1]
+labels <- dcast(labels, doc_id ~ label, value.var = "value", fill = 0)
+labels[, doc_id := NULL]
+labels[, colnames(labels)[colSums(labels) < 100] := NULL]
+dim(labels)
+
+# we need to divide the data into training and validation sets
+val_idx <- sort(sample(nrow(doc_embeddings), 10000))
+
+# building the kNN model
+model <- nn_predictions(doc_embeddings[-val_idx, ], doc_embeddings[val_idx, ], labels[-val_idx,])
+predicted_labels <- lapply(apply(labels, 1, function(x) which(x > 0)), names)
+
+# validation score:
+true_labels = strsplit(docs[, labels], ",")[val_idx]
+mean(mapply(F1score, predicted_labels, true_labels))
+# mabe the model wasn't so great after all ;-)
+# can you improve it???
+```
+
+\
+\
+\
+  
+  
+  

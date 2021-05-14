@@ -1,0 +1,433 @@
+---
+title: "Data Mining course 2020/2021"
+author: "Andrzej Janusz and Łukasz Grad"
+header-includes:
+  - \usepackage{amssymb}
+  - \usepackage{amsmath}
+  - \usepackage{amsthm}
+output:
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+subtitle: Lab7 - active learning on partially labeled data
+email: janusza@mimuw.edu.pl
+---
+
+### The plan:
+
+0. Problem description.
+1. Examples of sample informativeness functions.
+2. Active training batch selection. 
+
+```{r setup, results=FALSE, message=FALSE, warning=FALSE}
+options(width = 120)
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(glmnet)
+library(caret)
+library(doParallel)
+library(proxy)
+
+# Balanced Accuracy is a quality measure that we are going to use for this task
+balanced_acc <- function(y_true, y_pred) {
+    t = table(y_true, y_pred)
+    return(mean(diag(t) / table(y_true)))
+}
+```
+
+### Motivation for Active Learning
+
+In practical applications of predictive models, we often face the problem of limited availability of labeled data for training. Many prediction algorithms rely on the possibility to train their parameters on extensive collections of examples with known target decision classes/labels. However, quite often, obtaining such data is a challenge by itself. In a case when it requires manual work of domain experts, it can also be a costly and time-consuming process.    
+
+In such a scenario, it becomes substantial to know how to intelligently select examples -- first for labeling, and then for training the model. One way of doing that is to use the _active learning_ techniques.   
+
+In the active learning approach, we assume that even though we don't have unlimited access to labels for examples in our data, we can interactively query Oracle about the labels for selected cases. In particular, we can train our model in multiple iterations. In each iteration, we may query the Oracle about labels for some small subset of examples, and then re-train our model using obtained information. The critical task is to figure out which cases we should choose for the next query, so the information that we receive be the most beneficial for our prediction model.    
+
+As the leading example for the purpose of this script, we will use a data set related to the problem from the first _semester project_, namely decks from _Clash Royale_. Our task will be to learn how to predict deck archetypes (i.e. play-styles associated with a deck). We assume that initially, we have only $50$ labeled examples and that we can interactively query the Oracle to get additional $100$ labels. 
+
+You can download the data using this link:   
+https://drive.google.com/file/d/1_Jk6jmNMVzv7TxUavYNNGkIOf0UrCc3w/view?usp=sharing
+
+
+```{r cr_data}
+# reading the data
+data = data.table::fread("arch_data.csv", header = TRUE, sep = ",")
+
+# information about the archetype is in the 'arch' column
+head(data)
+
+# data size:
+dim(data)
+
+# let's do some data preprocessing
+y = data[, arch]
+X = as.matrix(data[, arch := NULL])
+
+# we have five archetypes, the distribution is imbalanced
+table(y)
+
+# we fix the test set for evaluation
+train_size = 300
+initial_size = 50
+total_size = 150
+train_indices = createDataPartition(y, p = train_size/length(y))[[1]] # we do stratified sampling
+
+y_train = y[train_indices]
+
+# we randomly sample the initially labeled set from training examples, we give more weight to rare archetypes
+active_indices = sample(train_indices, size = initial_size, 
+                        prob = 1 + 1/(table(y_train)[y_train]/length(train_indices)))
+active_indices = sort(active_indices)
+``` 
+
+```{r meta_params}
+# we set some meta-parameter values (we will discuss their significance later)
+alpha = 1
+beta = 1
+gamma = 7
+
+repetitions = 10
+
+cores = 6
+batch_sizes = c(1, 2, 5)
+
+info_list = c('Entropy', 'Margin', 'Random')
+param_grid = expand.grid(batch_sizes, info_list, stringsAsFactors = FALSE)
+batch_sizes = param_grid[, 1]
+infos = param_grid[, 2]
+```
+
+### Informativeness measures
+
+How can we estimate the usefulness of an example for our model? We should consider a few factors: 
+
+1. _Uncertainty of our model_. The more uncertain our models is when predicting the class of an example, the more valuable would be the information about this example's true class.
+2. _Representativeness_. Cases that are more representative of our data set are more valuable than 'outliers'. By learning from such examples, we will have better chances to generalize. 
+3. _Heterogeneity_. We want to choose a training set that is as heterogeneous as it is possible - we don't need to see labels of examples that are very similar to those for which we already know the labels.
+
+There are many ways in which we may quantify the uncertainty of prediction, representativeness, and heterogeneity. Below are some simple examples.
+
+```{r informativeness}
+# definitions of functions that can measure prediction uncertainty
+info_entropy <- function(scores, ...) {
+  return(-rowSums(scores * log(scores)))
+}
+
+info_margin <- function(scores, ...) {
+  top_probs = apply(scores, 1, function(x) sort(x, decreasing = T)[1:2])
+  return(1 - (top_probs[1,] - top_probs[2,]))
+}
+
+info_random <- function(scores, ...) {
+  return(rep(1, nrow(scores)))
+}
+
+informativeness_list = list(
+    Entropy=info_entropy,
+    Margin=info_margin,
+    Random=info_random
+)
+```
+
+```{r batch_selection, echo = FALSE}
+# below is a definition of a function for selecting a new batch for labeling
+# it is hidden in the HTML file to improve readability of the script
+normalize_fun <- function(x) {
+    N = length(x)
+    quantiles = 1:N / N
+    return(quantiles[rank(x)])
+}
+
+sample_batch <- function(pool, scores, batch_size, informativeness = 'Entropy',
+                         distance = 'Jaccard', multiply = TRUE, model = NULL,
+                         train_function = NULL, alpha = 1.0, beta = 1.0,
+                         gamma = 1.0, normalize = normalize_fun, censore = FALSE) {
+  `%op%` <-  if(multiply) `*` else `+`
+  `%weight_op%` <- if(multiply) `^` else `*`
+  
+  if (is.matrix(scores)) {
+    scores = t(apply(scores, 1, function(x) x / sum(x)))
+  }
+  
+  if (is.character(informativeness)) {
+    info_fun = informativeness_list[[informativeness]]
+  }
+  else {
+    info_fun = informativeness
+  }
+  
+  info_values = info_fun(pool=pool, scores=scores, model=model, train_function=train_function)
+  if (!is.null(normalize)) {
+    info_values = normalize(info_values)
+  }
+  
+  info_values = info_values %weight_op% alpha
+  if (censore) {
+    info_values_rank = rank(info_values) / length(info_values)
+    info_values[info_values_rank > 0.75] = min(info_values)
+  }
+  
+  if(beta != 0) {
+    if (is.character(distance)) {
+      distance_matrix = as.matrix(proxy::dist(pool, method = distance))
+    } else {
+      distance_matrix = distance
+    }
+    similarity_matrix = 1 - distance_matrix
+    similarity_average = rowMeans(similarity_matrix) %weight_op% beta
+    
+    if (!is.null(normalize)) {
+      similarity_average = normalize(similarity_average)
+    }
+  } else {
+    similarity_average = rep(1, nrow(pool))
+  }
+  
+  batch_ind = rep(0, batch_size)
+  distance_matrix = matrix(rep(0, nrow(pool)*(batch_size-1)), ncol=nrow(pool))
+  for (b in 1:batch_size) {
+    disimilarity_average = 1
+    if(gamma != 0)
+    {
+      
+      if (b == 1) {
+        disimilarity_average = rep(1, nrow(pool))
+      } else {
+        if (is.character(distance)) {
+          distance_matrix[b-1, ] = as.numeric(proxy::dist(pool[batch_ind[b-1], , drop = FALSE], pool, method = distance))
+        } else {
+          distance_matrix[b-1, ] = as.numeric(distance[batch_ind[b-1], , drop = FALSE])
+        }
+        if(any(is.na(distance_matrix[b-1, ]))) distance_matrix[b-1, is.na(distance_matrix[b-1, ])] = 0
+        disimilarity_average = colMeans(distance_matrix[1:(b-1), , drop=FALSE])
+      }
+      if (!is.null(normalize)) {
+        disimilarity_average = normalize(disimilarity_average)
+      }
+      disimilarity_average = disimilarity_average %weight_op% gamma
+    }
+    info_diversity_values = info_values %op% similarity_average %op% disimilarity_average
+    if (b > 1) {
+      info_diversity_values[batch_ind[1:b]] = 0
+    }
+    batch_ind[b] = which.max(info_diversity_values)
+  }
+  return(list(batch_ind=batch_ind,
+              dissimilarity_matrix=distance_matrix,
+              info_values=info_values)
+  )
+}
+
+# Performs batched active learning on a single fold. 
+# Lasso lambda parameter after each new batch is estimated with a nested cross-validation
+single_fold_active_learning <- function(train_indices, initial_ind, X, y, total_size = NULL, 
+                                        inner_folds = 5, batch_size = 1, 
+                                        informativeness = 'Entropy', alpha = 1, beta = 1, gamma = 1) {
+    initial_size = length(initial_ind)
+    
+    # Split data set into train and test sets
+    X_train = X[train_indices,]
+    y_train = y[train_indices]
+    X_test = X[-train_indices,]
+    y_test = y[-train_indices]
+    
+    # Perform active learning for all training samples if total size is NULL
+    if (is.null(total_size)) {
+        train_size = nrow(X_train)
+    } else {
+        train_size = total_size
+    }
+    
+    active_learning_rounds = ceiling((train_size - initial_size + 1) / batch_size)
+    train_acc = rep(0, active_learning_rounds)
+    test_acc = rep(0, active_learning_rounds)
+
+    test_dev = rep(0, active_learning_rounds)
+    test_dev_sd = rep(0, active_learning_rounds)
+    test_bal_acc = rep(0, active_learning_rounds)
+    train_bal_acc = rep(0, active_learning_rounds)
+    
+    active_indices = initial_ind
+
+    for (i in 1:active_learning_rounds) {
+        indices_mask = train_indices %in% active_indices
+        
+        # Nested CV is also performed on stratified folds, to ensure representativeness of rare classes
+        folds = caret::createFolds(y_train[indices_mask], k = inner_folds, returnTrain = FALSE)
+        foldid = rep(0, length(y_train[indices_mask]))
+        for (k in 1:inner_folds) {
+            foldid[folds[[k]]] = k
+        }
+        class_weights = 1. / (table(y_train[indices_mask]) / sum(table(y_train[indices_mask])))
+        w_mult = class_weights[y_train[indices_mask]]
+        cvfit = cv.glmnet(X_train[indices_mask,], y_train[indices_mask], 
+                          family = "multinomial", type.measure = 'deviance', parallel = TRUE, 
+                          foldid = foldid, keep = FALSE, weights = w_mult)
+        
+        # Save train and test accuracies
+        pred_test = predict(cvfit, newx = X_test, s = 'lambda.min', type = 'class')
+        pred_train = predict(cvfit, newx = X_train[indices_mask,], s = 'lambda.min', type = 'class')
+        train_acc[i] = mean(pred_train == y_train[indices_mask])
+        test_acc[i] = mean(pred_test == y_test)
+        
+        min_ind = which.min(cvfit$cvm)
+        test_dev[i] = cvfit$cvm[min_ind]
+        test_dev_sd[i] = cvfit$cvsd[min_ind]
+        test_bal_acc[i] = balanced_acc(y_test, pred_test)
+        train_bal_acc[i] = balanced_acc(y_train[indices_mask], pred_train)
+
+        # If active learning pool is not empty, sample new examples
+        if (sum(!indices_mask) > 0) {
+            pred_active = predict(cvfit, newx = X_train[!indices_mask, ], 
+                                  s = 'lambda.min', type = 'response')
+            new_indices = sample_batch(pool = X_train[!indices_mask,], scores = pred_active, 
+                                       informativeness = informativeness, 
+                                       batch_size = batch_size,
+                                       alpha = alpha, beta = beta, gamma = gamma)
+            new_indices = train_indices[!indices_mask][new_indices$batch_ind]
+            active_indices = c(active_indices, new_indices)
+        }
+    }
+    return(list(train_acc = train_acc, test_acc = test_acc, 
+                test_dev = test_dev, test_dev_sd = test_dev_sd,
+                test_bal_acc = test_bal_acc, train_bal_acc = train_bal_acc))
+}
+```
+
+In our example, we begin by choosing an initial training subset $A_0$ of size `r initial_size` at random. Then, at each step, we greedily select a sample that maximizes the importance:
+$$X^* = {argmax}_{x: T} \left[\phi(x)^{\alpha} \times Sim(x)^{\beta} \times Dis(x)^{\gamma}\right],$$
+
+where $\phi$ measures the informativeness of samples, $Sim(x) = \big(\frac{1}{u} \sum_{i=1}^u sim(x, x_i)\big)$ is a measure of a representativeness, and $Dis(x) = \big(\frac{1}{b} \sum_{i=1}^b dis(x, x^B_i)\big)$ measures the dissimilarity in the current batch, assuming that we have already chosen samples $(x^B_0, \dots, x^B_b)$. Parameters $\alpha, \beta, \gamma$ control the relative importance of each factor.
+
+The implementation of the function that selects a new batch of data is hidden in the HTML file (to improve readability), however, you can view it when you open this file in RStudio.
+
+### Active selection of a training set
+
+Now, we are ready to perform the experiment. I'm assuming that you know how does the _logistic regression_ with _lasso regularization_ works - we are going to use it as out prediction model. 
+
+```{r experiment, message=FALSE, warning=FALSE}
+# to speed things up, we will parallelize some of the computations
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+results = replicate(repetitions, 
+    expr = {
+      # the function single_fold_active_learning was defined in the previous cell (hidden in the HTML file)
+      lasso_active_learning_grid = foreach(batch_size = batch_sizes, informativeness = infos,
+                                           .packages = c("glmnet", "proxy", "data.table"), 
+                                           .export = c("single_fold_active_learning", "active_indices", "X", "y", 
+                                                       "train_indices", "total_size", "balanced_acc", "alpha", "beta", "gamma",
+                                                       "sample_batch", "informativeness_list", "normalize_fun")) %dopar% {
+          print(paste0('Running batch_size: ', batch_size, ', info: ', informativeness))
+          return(single_fold_active_learning(
+              train_indices, active_indices,
+              X = X, y = y,
+              total_size = total_size, batch_size = batch_size,
+              informativeness = informativeness,
+              alpha = alpha, beta = beta, gamma = gamma
+          ))
+      }
+      lasso_active_learning_grid
+    }, simplify = FALSE
+  )
+
+# switching off the cluster
+stopCluster(cl)
+```
+
+```{r aggregating_results}
+
+```
+
+
+Now, we only need to gather the results and plot some charts :-)
+
+```{r results}
+# Ugly, but works
+train_acc_all = c()
+test_acc_all = c()
+train_bal_acc_all = c()
+test_bal_acc_all = c()
+test_dev_all = c()
+test_dev_sd_all = c()
+sizes = c()
+batch = c()
+info = c()
+
+lasso_active_learning_grid = results[[1]]
+for(i in 2:length(results)) {
+  for(j in 1:length(results[[1]])) 
+    for(k in 1:length(results[[1]][[1]]))
+      lasso_active_learning_grid[[j]][[k]] = lasso_active_learning_grid[[j]][[k]] + results[[i]][[j]][[k]]
+}
+
+for (index in 1:nrow(param_grid)) {
+    b = batch_sizes[index]
+    inf = infos[index]
+    train_acc_all = c(train_acc_all, lasso_active_learning_grid[[index]]$train_acc/repetitions)
+    test_acc_all = c(test_acc_all, lasso_active_learning_grid[[index]]$test_acc/repetitions)
+        
+    train_bal_acc_all = c(train_bal_acc_all, lasso_active_learning_grid[[index]]$train_bal_acc/repetitions)
+    test_bal_acc_all = c(test_bal_acc_all, lasso_active_learning_grid[[index]]$test_bal_acc/repetitions)
+        
+    test_dev_all = c(test_dev_all, lasso_active_learning_grid[[index]]$test_dev/repetitions)
+    test_dev_sd_all = c(test_dev_sd_all, lasso_active_learning_grid[[index]]$test_dev_sd/repetitions)
+        
+    sizes = c(sizes, seq(initial_size, total_size, by = b))
+    batch = c(batch, rep(b, length(lasso_active_learning_grid[[index]]$train_acc)))
+    info = c(info, rep(inf, length(lasso_active_learning_grid[[index]]$train_acc)))
+}
+lasso_results = tibble(train_acc = train_acc_all, test_acc = test_acc_all,
+                       train_bal_acc = train_bal_acc_all, test_bal_acc = test_bal_acc_all,
+                       test_dev = test_dev_all, test_dev_sd = test_dev_sd_all,
+                       size = sizes, batch_size = batch, info = info)
+lasso_results
+```
+
+```{r}
+# Compute mean scores over all folds and append it to the results
+lasso_means = 
+    summarise(group_by(lasso_results, size, batch_size, info), 
+        train_acc = mean(train_acc),
+        test_acc = mean(test_acc),
+        train_bal_acc = mean(train_bal_acc),
+        test_bal_acc = mean(test_bal_acc),
+        test_dev = mean(test_dev),
+        test_dev_sd = mean(test_dev_sd)
+    )
+lasso_means
+```
+
+```{r, fig.width=14, fig.height=6}
+ggplot(lasso_means, aes(size, test_acc, colour = info)) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = 'loess') +
+    facet_wrap(~ batch_size) +
+    ggtitle('Test Accuracy vs Active Learning set size for different query batch sizes')
+```
+
+```{r, fig.width=14, fig.height=6}
+p = ggplot(lasso_means, aes(size, test_bal_acc, colour = info)) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = 'loess') +
+    facet_wrap(~ batch_size) +
+    ggtitle('Test Balanced Accuracy vs active learning sample size for different query batch sizes') +
+    xlab('Active learning sample size') +
+    ylab('Balanced Accuracy')
+p
+```
+
+### Exercise:
+Try to play with the meta-parameter settings of our algorithm (e.g., with _alpha_, _beta_, _gamma_, and _batch_size_). Can you suggest some better values? Compare the results to the quality of a model trained on the whole training set.
+
+\
+\
+\
+  
+  
+  
