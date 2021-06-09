@@ -17,8 +17,18 @@ def get_uniq(fname):
 train = get_uniq(TRAIN_FNAME)
 test = get_uniq(TEST_FNAME)
 
-print(test)
-print(test.difference(train))
+# print(test)
+# print(test.difference(train))
 
-print(pd.read_csv(TRAIN_FNAME).columns)
-print(pd.read_csv(TEST_FNAME).columns)
+# print(pd.read_csv(TRAIN_FNAME).columns)
+# print(pd.read_csv(TEST_FNAME).columns)
+
+
+df = pd.read_csv(TEST_FNAME)
+u = df["teams.1.3.gadgets_stats.4.id"].unique()
+print(list(u))
+
+df = pd.read_csv(TRAIN_FNAME)
+u = df["teams.1.3.gadgets_stats.4.id"].unique()
+print(list(u))
+
